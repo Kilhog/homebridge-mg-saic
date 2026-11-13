@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented here. This project doesn't yet follow strict semantic versioning guarantees while it's pre-1.0, breaking config changes are called out explicitly below when they happen.
 
+## Unreleased
+
+- **Network failures no longer surface as raw `fetch failed` errors, and are retried where that's safe.** Found from a real incident (13 Nov 2026, Node 22): two logins in a row failed with `TypeError: fetch failed` / `UND_ERR_CONNECT_TIMEOUT` after 10 s on one gateway address, and everything worked again a minute later. Every HTTP attempt now has its own 20 s timeout (connect + response; undici's defaults could otherwise leave a request hanging up to 300 s). Network errors, timeouts and HTTP 5xx/429 become a `SaicTransportError`, which records whether the error proves the request never left (connect timeout, refused connection, DNS failure) or may have reached the gateway (reset, socket error, read timeout, 5xx). Login, the vehicle list, and the first request of a status or charging poll are retried up to 4 times with exponential backoff and jitter (about 2, 4, 8 s). A control command is never re-sent here.
+
 ## 0.9.10
 
 - **Added a lock-triggered rapid refresh sequence to catch a plug-in faster after arriving home.** When the car's lockStatus transitions from unlocked to locked and the charger isn't already known to be plugged in, the plugin now fires a short burst of extra polls — 1, 3, 7, 15 and 25 minutes after the lock, cumulative — instead of waiting for the next scheduled poll (which can be a long way off on a relaxed `pollIntervalMs`) or for the charging-skip streak (see 0.9.8) to run out. Each step forces a real charging check regardless of the skip streak, and the sequence stops as soon as a plug-in is seen. Ported from `mg-saic-ha`'s post-shutdown refresh sequence (lock-engaged trigger); its message-queue-driven event refresh (engine start/stop detection) was not ported — a bigger undertaking with less clear payoff for this plugin's simpler polling model.
