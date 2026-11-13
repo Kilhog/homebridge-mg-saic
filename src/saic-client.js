@@ -378,13 +378,38 @@ export class SaicClient {
   // rvcReqType "32" is the separate rear window defrost command (paramId 23, one byte on/off).
   // Confirmed working against a real MG4 - see the plugin's TESTING.md.
 
-  /** level is 0-3 per the reference client (0 = off); this plugin only ever sends 0 or 3. */
+  /**
+   * level is 0-3 per the reference client (0 = off). The "on" level the plugin sends comes
+   * from the frontSeatHeatLevel option (default 3, the only value used before it existed).
+   */
   controlHeatedSeats(vin, { leftLevel = 0, rightLevel = 0 } = {}) {
     return this.vehicleControl(vin, {
       rvcReqType: '5',
       rvcParams: [
         { paramId: 17, paramValue: b64([leftLevel]) },
         { paramId: 18, paramValue: b64([rightLevel]) },
+        { paramId: 255, paramValue: b64([0, 0, 0, 0]) },
+      ],
+    });
+  }
+
+  /**
+   * One heated seat on its own (the reference client's control_heated_seat): rvcReqType "5",
+   * a single param for the seat (17 front left, 18 front right, 25 rear left, 26 rear right),
+   * then the paramId 255 terminator. Rear seats are on/off, on = 3. Used for the rear seats
+   * only. See saic-client.ts for the fuller version of this comment.
+   */
+  controlHeatedSeat(vin, seat, level) {
+    if (!Object.values(HEATED_SEAT).includes(seat)) {
+      return Promise.reject(new RangeError(`Unknown heated seat param ${seat}`));
+    }
+    if (!Number.isInteger(level) || level < 0 || level > 3) {
+      return Promise.reject(new RangeError(`Heated seat level must be 0-3, got ${level}`));
+    }
+    return this.vehicleControl(vin, {
+      rvcReqType: '5',
+      rvcParams: [
+        { paramId: seat, paramValue: b64([level]) },
         { paramId: 255, paramValue: b64([0, 0, 0, 0]) },
       ],
     });
@@ -482,6 +507,12 @@ export class SaicClient {
 }
 
 export const LOCK_ID = { TAILGATE: 2, DOORS: 3 };
+
+/** paramIds for controlHeatedSeat, by physical seat (the reference client's HeatedSeat). */
+export const HEATED_SEAT = { FRONT_LEFT: 17, FRONT_RIGHT: 18, REAR_LEFT: 25, REAR_RIGHT: 26 };
+
+/** Rear seats are on/off only; the iSmart app sends this level for "on". */
+export const REAR_HEATED_SEAT_ON_LEVEL = 3;
 
 export const WINDOW_ID = { SUNROOF: 8, DRIVER: 9, WINDOW_2: 10, WINDOW_3: 11, WINDOW_4: 12 };
 

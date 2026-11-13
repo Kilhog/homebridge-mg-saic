@@ -194,6 +194,23 @@ Both seats are set in a single request, there's no way to change one without als
 
 `paramValue` for 17 and 18 is base64 of a single level byte, 0 = off, the reference client supports up to 3 (this plugin only ever sends 0 or 3). The reference client calls param 17 "driver" and 18 "passenger", but this project's own captured `/vehicle/status` response uses positional field names instead, `frontLeftSeatHeatLevel` and `frontRightSeatHeatLevel`. Which of 17/18 corresponds to which physical seat, and whether that's consistent across left- and right-hand-drive markets, is **not confirmed**. Test one side at a time and watch which actual seat heats up.
 
+### One heated seat at a time, incl. rear seats (`rvcReqType: "5"`, single param)
+
+The reference client also has a per-seat form, `control_heated_seat` (`api/vehicle/climate`), with a single param for the chosen seat, so the others don't have to be restated:
+
+```json
+{
+  "rvcReqType": "5",
+  "rvcParams": [
+    { "paramId": "<17 front left, 18 front right, 25 rear left, 26 rear right>", "paramValue": "<level>" },
+    { "paramId": 255, "paramValue": "AAAAAA==" }
+  ],
+  "vin": "<sha256 hex of VIN>"
+}
+```
+
+Front seats take 0–3. Rear seats are on/off only (in the app and in the car); the app sends `3` (`Aw==`) for on and `0` for off. The reference client documents 17/18 as the physical front-left/front-right seats on both left- and right-hand drive (checked on a right-hand drive MG S6 EV, where the app's front-left seat sends 17). Rear seat state comes back in `secondRowLeftSeatHeatLevel` / `secondRowRightSeatHeatLevel`. This plugin uses the per-seat form for the rear seats only (`enableRearHeatedSeats`, not yet confirmed on real hardware); the front seats keep the two-seat request above.
+
 ### Rear window defrost (`rvcReqType: "32"`)
 
 ```json
@@ -345,6 +362,7 @@ Field names as returned by the API, decoded meaning based on a live capture:
 | `mileage` | Tenths of a km |
 | `vehicleAlarmStatus` | Meaning not yet confirmed |
 | `frontLeftSeatHeatLevel`, `frontRightSeatHeatLevel` | `0` = off, drives the two heated seat Switches (off by default, confirmed working) |
+| `secondRowLeftSeatHeatLevel`, `secondRowRightSeatHeatLevel` | Rear seats, `0` = off, non-zero = on. Drive the two rear heated seat Switches (off by default, not yet confirmed). Absent on cars without heated rear seats |
 | `rmtHtdRrWndSt` | `0` = off, drives the rear defrost Switch (off by default, confirmed working) |
 | `driverWindow`, `passengerWindow`, `rearLeftWindow`, `rearRightWindow` | `0` = closed. Readable, but there's no writable Switch for these, see "Windows" above |
 
