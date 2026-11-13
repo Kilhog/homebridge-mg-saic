@@ -255,7 +255,9 @@ The reference client documents none of this — it just defaults `temperature_id
 temperature_idx = 3 + (desired_temp_celsius - 17)
 ```
 
-Range 17 °C (index 3) to 33 °C (index 19). So the reference client's default of **index 8 is 22 °C** — a mild target, not a maximum. This plugin currently hardcodes index 8, i.e. every pre-conditioning start asks the car for 22 °C.
+Range 17 °C (index 3) to 33 °C (index 19) in that profile. So the reference client's default of **index 8 is 22 °C** — a mild target, not a maximum.
+
+`saic-python-mqtt-gateway` (`src/vehicle_info.py`) writes the index as `3 + °C − 17` for series `EH32` and `2 + °C − 16` for every other series — i.e. always `°C − 14`, the same formula. What differs per series is the accepted range: `EH32` 17–31 °C, `MZS3E` 16–31 °C, anything else 16–28 °C. This plugin follows the gateway for the range (so the MG S6 EV, series `MIS3E`, gets 16–28 °C, unconfirmed), except that `EH32` keeps the 17–33 °C above, which is what this plugin has always offered on a real MG4. `climateMinTemperature` / `climateMaxTemperature` override it.
 
 **Heat vs cool is decided by the compressor flag, not the temperature — in theory.** The MG4 heats with the compressor **off**, using the PTC resistive heater: `start_ac` omits param 22 entirely, the compressor stays off, and the car drives toward the target temperature with the heater. That much is confirmed and working as intended.
 

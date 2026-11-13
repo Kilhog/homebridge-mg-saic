@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { MgSaicAccessory } from '../src/accessory.js';
+import { MgSaicAccessory, climateTemperatureRange, climateTemperatureIndex } from '../src/accessory.js';
 
 // ---------------------------------------------------------------------------
 // Minimal stub for api.hap so we can construct MgSaicAccessory without
@@ -78,12 +78,15 @@ function makeAccessory(overrides = {}) {
   const platformAccessory = {
     getService: (name) => serviceCache[name] ?? null,
     addService: (type, name) => {
+      // One shared characteristic stub per service, so a test can inspect what was set on it
+      // (e.g. setProps ranges) through service.getCharacteristic().
+      const characteristic = {
+        onGet: vi.fn().mockReturnThis(),
+        onSet: vi.fn().mockReturnThis(),
+        setProps: vi.fn().mockReturnThis(),
+      };
       const svc = {
-        getCharacteristic: () => ({
-          onGet: vi.fn().mockReturnThis(),
-          onSet: vi.fn().mockReturnThis(),
-          setProps: vi.fn().mockReturnThis(),
-        }),
+        getCharacteristic: () => characteristic,
         updateCharacteristic: vi.fn(),
         setCharacteristic: vi.fn().mockReturnThis(),
       };
@@ -623,6 +626,83 @@ describe('setCoolTemperature', () => {
     acc._lastStatus = { basicVehicleStatus: { remoteClimateStatus: 3 } };
     client.startClimate.mockRejectedValue(new Error('timeout'));
     await expect(acc.setCoolTemperature(24)).rejects.toThrow('HapStatusError');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// climate temperature range and index
+// ---------------------------------------------------------------------------
+
+describe('climateTemperatureRange', () => {
+  it('keeps 17-33 °C for the MG4 (EH32) and for an unknown series', () => {
+    expect(climateTemperatureRange('EH32 S')).toEqual({ min: 17, max: 33 });
+    expect(climateTemperatureRange(undefined)).toEqual({ min: 17, max: 33 });
+    expect(climateTemperatureRange('  ')).toEqual({ min: 17, max: 33 });
+  });
+
+  it('uses the MQTT gateway ranges for other series', () => {
+    expect(climateTemperatureRange('MZS3E')).toEqual({ min: 16, max: 31 });
+    // MG S6 EV: series "MIS3E S" is neither EH32 nor MZS3E -> the gateway default
+    expect(climateTemperatureRange('MIS3E S')).toEqual({ min: 16, max: 28 });
+    expect(climateTemperatureRange('mis3e s')).toEqual({ min: 16, max: 28 });
+  });
+
+  it('applies valid config overrides, either bound on its own', () => {
+    expect(climateTemperatureRange('MIS3E S', { min: 17, max: 30 })).toEqual({ min: 17, max: 30 });
+    expect(climateTemperatureRange('MIS3E S', { max: 30 })).toEqual({ min: 16, max: 30 });
+    expect(climateTemperatureRange('EH32 S', { min: 18 })).toEqual({ min: 18, max: 33 });
+  });
+
+  it('ignores invalid overrides, keeps the series range and says why', () => {
+    for (const overrides of [{ min: 15 }, { max: 34 }, { min: 20.5 }, { min: '18' }, { min: 25, max: 20 }, { min: 20, max: 20 }]) {
+      const range = climateTemperatureRange('MIS3E S', overrides);
+      expect(range).toMatchObject({ min: 16, max: 28 });
+      expect(range.error).toMatch(/Ignoring climateMinTemperature/);
+    }
+  });
+});
+
+describe('climateTemperatureIndex', () => {
+  it('is °C - 14, the same formula as mg-saic-ha (MG4) and the MQTT gateway (all series)', () => {
+    expect(climateTemperatureIndex(16)).toBe(2);
+    expect(climateTemperatureIndex(17)).toBe(3);
+    expect(climateTemperatureIndex(22)).toBe(8);
+    expect(climateTemperatureIndex(28)).toBe(14);
+    expect(climateTemperatureIndex(33)).toBe(19);
+  });
+});
+
+describe('climate range on the accessory', () => {
+  it('defaults to 17-33 °C when no range is given (unchanged MG4 behaviour)', () => {
+    const { acc } = makeAccessory();
+    expect(acc.climateRange).toEqual({ min: 17, max: 33 });
+    expect(acc.heatService.getCharacteristic().setProps)
+      .toHaveBeenCalledWith({ minValue: 17, maxValue: 33, minStep: 1 });
+  });
+
+  it('sets both sliders to the given range', () => {
+    const { acc } = makeAccessory({ climateRange: { min: 16, max: 28 } });
+    expect(acc.heatService.getCharacteristic().setProps)
+      .toHaveBeenCalledWith({ minValue: 16, maxValue: 28, minStep: 1 });
+    expect(acc.coolService.getCharacteristic().setProps)
+      .toHaveBeenCalledWith({ minValue: 16, maxValue: 28, minStep: 1 });
+  });
+
+  it('clamps a target outside the range and sends the clamped index', async () => {
+    const { acc, client } = makeAccessory({ climateRange: { min: 16, max: 28 } });
+    acc._lastStatus = { basicVehicleStatus: { remoteClimateStatus: 2 } };
+    client.startClimate.mockResolvedValue({});
+    await acc.setHeatTemperature(31);
+    expect(acc._heatTargetTemp).toBe(28);
+    expect(client.startClimate).toHaveBeenCalledWith('TESTVIN123', 14, false);
+  });
+
+  it('sends index 2 for 16 °C, the bottom of the non-MG4 range', async () => {
+    const { acc, client } = makeAccessory({ climateRange: { min: 16, max: 28 } });
+    client.startClimate.mockResolvedValue({});
+    acc._heatTargetTemp = 16;
+    await acc.setHeatActive(true);
+    expect(client.startClimate).toHaveBeenCalledWith('TESTVIN123', 2, false);
   });
 });
 

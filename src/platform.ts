@@ -1,6 +1,7 @@
 import type { API, PlatformAccessory, Logging, PlatformConfig } from 'homebridge';
 import { SaicClient, SaicError } from './saic-client.js';
-import { MgSaicAccessory } from './accessory.js';
+import { MgSaicAccessory, climateTemperatureRange } from './accessory.js';
+import type { ClimateTemperatureRange } from './accessory.js';
 
 const PLUGIN_NAME   = 'homebridge-mg-saic';
 const PLATFORM_NAME = 'MgSaic';
@@ -22,6 +23,7 @@ export class MgSaicPlatform {
   private enableFrontDefrost: boolean;
   private enableExperimentalCabinCool: boolean;
   private configuredVin: string | undefined;
+  private climateRange?: ClimateTemperatureRange;
 
   private client: SaicClient;
   private vehicle?: MgSaicAccessory;
@@ -138,6 +140,22 @@ export class MgSaicPlatform {
       this.log.info(`Vehicle series: ${matchedVehicle.series}${name ? ` (${name})` : ''}`);
     }
 
+    // The same series code also picks the Cabin Heat / Cabin Cool slider range, the way
+    // saic-python-mqtt-gateway does (see climateTemperatureRange), unless config overrides it.
+    // (null, which a cleared form field can leave behind, counts as not set.)
+    const minOverride: unknown = this.config['climateMinTemperature'] ?? undefined;
+    const maxOverride: unknown = this.config['climateMaxTemperature'] ?? undefined;
+    const range = climateTemperatureRange(matchedVehicle?.series, { min: minOverride, max: maxOverride });
+    if (range.error) this.log.warn(range.error);
+    this.climateRange = { min: range.min, max: range.max };
+    if (this.enablePreconditioning) {
+      const overridden = !range.error && (minOverride !== undefined || maxOverride !== undefined);
+      const source = overridden ? 'from config'
+        : matchedVehicle?.series ? `for series ${matchedVehicle.series}`
+          : 'default, vehicle series unknown';
+      this.log.info(`Climate target temperature range: ${range.min}-${range.max} °C (${source}).`);
+    }
+
     this.registerAccessory(vin);
     this.startPolling();
   }
@@ -164,6 +182,7 @@ export class MgSaicPlatform {
       enableRearDefrost:        this.enableRearDefrost,
       enableFrontDefrost:       this.enableFrontDefrost,
       enableExperimentalCabinCool: this.enableExperimentalCabinCool,
+      climateRange:             this.climateRange,
     });
 
     // The accessory constructor above adds or reuses services according to the current

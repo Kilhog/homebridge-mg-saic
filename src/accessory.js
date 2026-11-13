@@ -50,7 +50,7 @@
  * and "Cabin Cool", rather than one tile with a mode toggle. Each is locked to a
  * single TargetHeaterCoolerState (HEAT or COOL respectively, via validValues) and
  * carries its own remembered target temperature (_heatTargetTemp/_coolTargetTemp,
- * 17-33 °C). Turning Heat's Active on sends startClimate with the compressor off
+ * within climateRange - see climateTemperatureRange below, 17-33 °C on an MG4). Turning Heat's Active on sends startClimate with the compressor off
  * and immediately mirrors Active=INACTIVE onto the other tile, since the car only
  * has one underlying climate system. Cabin Cool's Active toggle is disabled by
  * default - confirmed on real hardware to heat at maximum instead of cooling, see
@@ -69,6 +69,54 @@
  */
 
 import { SaicError } from './saic-client.js';
+
+// ------------------------------------------------------- climate temperature
+
+/**
+ * Bounds a configured climateMinTemperature/climateMaxTemperature must stay within: 16 °C
+ * (saic-python-mqtt-gateway, non-MG4 series) to 33 °C (mg-saic-ha's MG4 profile).
+ */
+export const CLIMATE_TEMPERATURE_LIMITS = { min: 16, max: 33 };
+
+/**
+ * Target temperature range for the Cabin Heat / Cabin Cool sliders, from the vehicle's
+ * series code as saic-python-mqtt-gateway's vehicle_info.py does: EH32 (MG4) 17-33 °C
+ * (kept at this plugin's historic max, the gateway says 31), MZS3E 16-31 °C, any other
+ * series 16-28 °C (MG S6 EV "MIS3E ...", unconfirmed), no series known 17-33 °C. Config
+ * overrides replace either bound if the result is whole numbers within
+ * CLIMATE_TEMPERATURE_LIMITS with min below max; otherwise `error` says why. See
+ * accessory.ts for the fuller version of this comment.
+ */
+export function climateTemperatureRange(series, overrides = {}) {
+  const code = (series ?? '').trim().toUpperCase();
+  const base = !code || code.startsWith('EH32') ? { min: 17, max: 33 }
+    : code.startsWith('MZS3E') ? { min: 16, max: 31 }
+      : { min: 16, max: 28 };
+  if (overrides.min === undefined && overrides.max === undefined) return base;
+
+  const min = overrides.min ?? base.min;
+  const max = overrides.max ?? base.max;
+  const inLimits = (v) => typeof v === 'number' && Number.isInteger(v)
+    && v >= CLIMATE_TEMPERATURE_LIMITS.min && v <= CLIMATE_TEMPERATURE_LIMITS.max;
+  if (!inLimits(min) || !inLimits(max) || min >= max) {
+    return {
+      ...base,
+      error: `Ignoring climateMinTemperature/climateMaxTemperature (${String(overrides.min)}/${String(overrides.max)}): `
+        + `both must be whole numbers from ${CLIMATE_TEMPERATURE_LIMITS.min} to ${CLIMATE_TEMPERATURE_LIMITS.max} °C, `
+        + `min below max. Using ${base.min}-${base.max} °C.`,
+    };
+  }
+  return { min, max };
+}
+
+/**
+ * SAIC climate temperature index: idx = °C - 14. Same formula in mg-saic-ha's MG4 profile
+ * (3 + °C - 17) and in saic-python-mqtt-gateway for every series (3 + °C - 17 for EH32,
+ * 2 + °C - 16 otherwise).
+ */
+export function climateTemperatureIndex(celsius) {
+  return Math.round(celsius) - 14;
+}
 
 // Door field→service-index mapping, used in both setupContactSensors and pushStatusCharacteristics.
 const DOOR_FIELDS = [
@@ -90,11 +138,12 @@ export class MgSaicAccessory {
   /**
    * @param {import('homebridge').PlatformAccessory} accessory
    * @param {import('./saic-client.js').SaicClient} client
-   * @param {{ vin: string, log: any, api: any, enablePreconditioning: boolean, enableDoorSensors: boolean, enableTemperatureSensors: boolean, enableHeatedSeats: boolean, enableRearDefrost: boolean, enableFrontDefrost: boolean, enableExperimentalCabinCool?: boolean }} opts
+   * @param {{ vin: string, log: any, api: any, enablePreconditioning: boolean, enableDoorSensors: boolean, enableTemperatureSensors: boolean, enableHeatedSeats: boolean, enableRearDefrost: boolean, enableFrontDefrost: boolean, enableExperimentalCabinCool?: boolean, climateRange?: { min: number, max: number } }} opts
    */
   constructor(accessory, client, {
     vin, log, api, enablePreconditioning, enableDoorSensors, enableTemperatureSensors,
     enableHeatedSeats, enableRearDefrost, enableFrontDefrost, enableExperimentalCabinCool = false,
+    climateRange = climateTemperatureRange(),
   }) {
     this.accessory = accessory;
     this.client = client;
@@ -111,6 +160,8 @@ export class MgSaicAccessory {
     this.enableRearDefrost = enableRearDefrost;
     this.enableFrontDefrost = enableFrontDefrost;
     this.enableExperimentalCabinCool = enableExperimentalCabinCool;
+    // Slider range for Cabin Heat / Cabin Cool, see climateTemperatureRange.
+    this.climateRange = { min: climateRange.min, max: climateRange.max };
     // Tracks only what HomeKit last commanded for front defrost, not a value read back
     // from the car - see setFrontDefrost for why.
     this._frontDefrostActive = false;
@@ -154,11 +205,11 @@ export class MgSaicAccessory {
     // to avoid hidden-class churn from dynamic property assignment.
     this._lastInteriorTemperature = null;
     this._lastExteriorTemperature = null;
-    // User-chosen target temperature in °C (17-33) for each pre-conditioning tile.
-    // Persists across on/off toggles. Kept separate per tile since Heat and Cool
+    // User-chosen target temperature in °C (within climateRange) for each pre-conditioning
+    // tile. Persists across on/off toggles. Kept separate per tile since Heat and Cool
     // are now independent HeaterCooler services rather than one shared mode.
-    this._heatTargetTemp = 22;
-    this._coolTargetTemp = 22;
+    this._heatTargetTemp = this.clampClimateTemp(22);
+    this._coolTargetTemp = this.clampClimateTemp(22);
 
     this.logExposedServices();
   }
@@ -273,7 +324,7 @@ export class MgSaicAccessory {
       .onGet(() => this.readInteriorTempForClimate());
 
     this.heatService.getCharacteristic(this.Characteristic.HeatingThresholdTemperature)
-      .setProps({ minValue: 17, maxValue: 33, minStep: 1 })
+      .setProps({ minValue: this.climateRange.min, maxValue: this.climateRange.max, minStep: 1 })
       .onGet(() => this._heatTargetTemp)
       .onSet((value) => this.setHeatTemperature(value));
 
@@ -303,7 +354,7 @@ export class MgSaicAccessory {
       .onGet(() => this.readInteriorTempForClimate());
 
     this.coolService.getCharacteristic(this.Characteristic.CoolingThresholdTemperature)
-      .setProps({ minValue: 17, maxValue: 33, minStep: 1 })
+      .setProps({ minValue: this.climateRange.min, maxValue: this.climateRange.max, minStep: 1 })
       .onGet(() => this._coolTargetTemp)
       .onSet((value) => this.setCoolTemperature(value));
   }
@@ -536,7 +587,7 @@ export class MgSaicAccessory {
     this.log.info(`${value ? 'Starting' : 'Stopping'} cabin heat pre-conditioning via HomeKit...`);
     try {
       if (value) {
-        const idx = 3 + Math.round(this._heatTargetTemp - 17);
+        const idx = climateTemperatureIndex(this._heatTargetTemp);
         await this.client.startClimate(this.vin, idx, false);
       } else {
         await this.client.stopClimate(this.vin);
@@ -579,7 +630,7 @@ export class MgSaicAccessory {
       : 'Stopping cabin cool pre-conditioning via HomeKit...');
     try {
       if (value) {
-        const idx = 3 + Math.round(this._coolTargetTemp - 17);
+        const idx = climateTemperatureIndex(this._coolTargetTemp);
         await this.client.startClimate(this.vin, idx, false);
       } else {
         await this.client.stopClimate(this.vin);
@@ -603,17 +654,23 @@ export class MgSaicAccessory {
     }
   }
 
+  /** Keeps a target temperature inside climateRange (HomeKit enforces it too, via setProps). */
+  clampClimateTemp(temp) {
+    return Math.min(this.climateRange.max, Math.max(this.climateRange.min, temp));
+  }
+
   /**
    * Handles a HeatingThresholdTemperature change on the "Cabin Heat" tile.
    * Stores the new target and, if that tile is currently active, re-sends
    * startClimate with the updated index so the car adjusts immediately.
    */
-  async setHeatTemperature(temp) {
+  async setHeatTemperature(value) {
+    const temp = this.clampClimateTemp(value);
     this._heatTargetTemp = temp;
     if (this.readHeatActive()) {
       this.log.info(`Adjusting cabin heat target to ${temp} °C...`);
       try {
-        const idx = 3 + Math.round(temp - 17);
+        const idx = climateTemperatureIndex(temp);
         await this.client.startClimate(this.vin, idx, false);
         this.log.info(`Cabin heat target updated to ${temp} °C.`);
       } catch (err) {
@@ -628,7 +685,8 @@ export class MgSaicAccessory {
    * the new target; while the tile is active, re-sends the start command only with
    * enableExperimentalCabinCool, and then without the compressor flag.
    */
-  async setCoolTemperature(temp) {
+  async setCoolTemperature(value) {
+    const temp = this.clampClimateTemp(value);
     this._coolTargetTemp = temp;
     if (this.readCoolActive()) {
       if (!this.enableExperimentalCabinCool) {
@@ -637,7 +695,7 @@ export class MgSaicAccessory {
       }
       this.log.info(`Adjusting cabin cool target to ${temp} °C (experimental)...`);
       try {
-        const idx = 3 + Math.round(temp - 17);
+        const idx = climateTemperatureIndex(temp);
         await this.client.startClimate(this.vin, idx, false);
         this.log.info(`Cabin cool target updated to ${temp} °C.`);
       } catch (err) {
