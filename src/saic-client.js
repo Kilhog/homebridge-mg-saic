@@ -64,6 +64,32 @@ function appVerificationString({ path, ts, contentType, content, token }) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ------------------------------------------------------------------ transport
+//
+// See saic-client.ts for the incident behind this (13 Nov 2026: fetch failed with
+// UND_ERR_CONNECT_TIMEOUT at login, cleared a minute later).
+
+/** Cap on one HTTP attempt, connect + full response. Overridable per client (tests). */
+export const REQUEST_TIMEOUT_MS = 20_000;
+
+/** Bounded retries for transient failures on safe-to-repeat requests: 2 s, 4 s, 8 s (cap 10 s), 50-100 % jitter. */
+export const TRANSPORT_RETRY = { attempts: 4, baseDelayMs: 2_000, maxDelayMs: 10_000 };
+
+/**
+ * Pause before logging in again after a login the gateway itself refused (wrong password,
+ * account paused...): 1, 2, 4, 8 then 15 min. SAIC allows one session per account and has
+ * been seen pausing an account for ~15 min when it sees too many logins, so a stuck re-login
+ * loop must not hammer it. Network failures don't count, they never reached SAIC.
+ */
+export const LOGIN_COOLDOWN = { baseMs: 60_000, maxMs: 15 * 60_000 };
+
+/** Codes (on fetch's TypeError cause) that prove the request never reached the server. */
+const NOT_SENT_CODES = new Set(['UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
+/** Transient codes where the request may already have reached the server. */
+const MAYBE_SENT_CODES = new Set([
+  'UND_ERR_SOCKET', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE',
+]);
+
 // --------------------------------------------------------------------- errors
 
 export class SaicError extends Error {
@@ -72,6 +98,63 @@ export class SaicError extends Error {
     this.name = 'SaicError';
     this.code = code;
   }
+}
+
+/**
+ * A transient transport failure: network error, per-attempt timeout, or HTTP 5xx/429.
+ * `notSent` is true only when the error proves the request never left this machine.
+ */
+export class SaicTransportError extends SaicError {
+  constructor(message, reason, notSent, httpStatus = 0) {
+    super(message, httpStatus);
+    this.name = 'SaicTransportError';
+    this.reason = reason;
+    this.notSent = notSent;
+  }
+}
+
+/**
+ * A control command whose outcome can't be known (connection lost after sending: code 0, or
+ * no answer from the car before the deadline: code 408). Deliberately not re-sent.
+ */
+export class SaicCommandOutcomeUnknown extends SaicError {
+  constructor(message, code) {
+    super(message, code);
+    this.name = 'SaicCommandOutcomeUnknown';
+  }
+}
+
+/** Every error code on an error, its cause, and an AggregateError's inner errors. */
+function errorCodes(err) {
+  const codes = new Set();
+  const visit = (e) => {
+    if (typeof e?.code === 'string') codes.add(e.code);
+    if (Array.isArray(e?.errors)) e.errors.forEach(visit);
+  };
+  visit(err);
+  visit(err?.cause);
+  return [...codes];
+}
+
+/**
+ * Turns what fetch() (or reading its body) threw into a SaicTransportError when it's a
+ * transient network problem, or null otherwise. See saic-client.ts for the error shapes.
+ */
+export function classifyTransportError(err) {
+  if (err instanceof SaicError) return null;
+  const name = err?.name;
+  if (name === 'TimeoutError' || name === 'AbortError') {
+    return new SaicTransportError(`No complete response within the request timeout (${String(name)})`, String(name), false);
+  }
+  const codes = errorCodes(err).filter((c) => NOT_SENT_CODES.has(c) || MAYBE_SENT_CODES.has(c));
+  if (codes.length === 0) return null;
+  const notSent = codes.every((c) => NOT_SENT_CODES.has(c));
+  return new SaicTransportError(`Network error: ${codes.join('/')}`, codes[0], notSent);
+}
+
+/** A logged-out response (401/403), as opposed to a network failure. */
+function isAuthError(err) {
+  return err instanceof SaicError && !(err instanceof SaicTransportError) && (err.code === 401 || err.code === 403);
 }
 
 class SaicRetry extends Error {
@@ -88,15 +171,19 @@ class SaicRetry extends Error {
 export class SaicClient {
   /**
    * @param {string} region One of the REGIONS keys, e.g. "Australia".
-   * @param {{ log?: { info: Function, debug: Function, warn: Function } }} opts
+   * @param {{ log?: { info: Function, debug: Function, warn: Function }, requestTimeoutMs?: number }} opts
    */
-  constructor(region = 'Australia', { log } = {}) {
+  constructor(region = 'Australia', { log, requestTimeoutMs = REQUEST_TIMEOUT_MS } = {}) {
     const r = REGIONS[region];
     if (!r) throw new Error(`Unknown region: ${region}`);
     this.baseUri = r.uri;
     this.region = r.code;
     this.token = '';
     this.log = log ?? { info: () => {}, debug: () => {}, warn: () => {} };
+    this.requestTimeoutMs = requestTimeoutMs;
+    // Called once every control command has settled ('ok' | 'failed' | 'unknown'); the
+    // accessory re-reads the car's state after an unknown outcome.
+    this.onControlSettled = undefined;
     // Stable device identifier reused across logins so the server always sees the same device.
     this._deviceId = 'simulator*********************************************' + Math.floor(Date.now() / 1000);
     // /vehicle/control commands are serialised through this chain. Firing two at once (e.g.
@@ -110,6 +197,11 @@ export class SaicClient {
     // _loginPromise is set to the in-flight login while it is running, cleared on
     // settle, so a second caller just awaits the same promise.
     this._loginPromise = null;
+    // Kept from the last login() call so an expired session can be renewed once, mid-request.
+    this._credentials = undefined;
+    // Consecutive logins the gateway refused, and when the next attempt is allowed.
+    this._loginFailures = 0;
+    this._loginBlockedUntil = 0;
   }
 
   /** Runs fn() only after every previously queued control command has settled (win or lose). */
@@ -123,8 +215,35 @@ export class SaicClient {
     return Boolean(this.token);
   }
 
+  /** Waits between retries. A method so tests can replace it instead of waiting for real. */
+  _sleep(ms) {
+    return sleep(ms);
+  }
+
+  /** Backoff before retry number `attempt` (1-based): exponential, capped, 50-100 % jitter. */
+  _backoffDelay(attempt) {
+    const ceiling = Math.min(TRANSPORT_RETRY.maxDelayMs, TRANSPORT_RETRY.baseDelayMs * 2 ** (attempt - 1));
+    return Math.round(ceiling / 2 + Math.random() * (ceiling / 2));
+  }
+
+  /** Runs fn, retrying on a SaicTransportError up to TRANSPORT_RETRY.attempts times in all. */
+  async _withTransportRetries(label, fn) {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await fn();
+      } catch (err) {
+        if (!(err instanceof SaicTransportError) || attempt >= TRANSPORT_RETRY.attempts) throw err;
+        const wait = this._backoffDelay(attempt);
+        this.log.debug(`${label}: ${err.message}, retrying in ${(wait / 1000).toFixed(1)}s `
+          + `(attempt ${attempt + 1}/${TRANSPORT_RETRY.attempts}).`);
+        await this._sleep(wait);
+      }
+    }
+  }
+
   async rawRequest(method, path, { formBody, jsonBody, params, eventId } = {}) {
     const query = params ? '?' + new URLSearchParams(params).toString() : '';
+    const tokenUsed = this.token;
     const url = this.baseUri + path.replace(/^\//, '') + query;
     const requestPath = url.replace(this.baseUri, '/');
     const ts = String(Date.now());
@@ -167,8 +286,24 @@ export class SaicClient {
     if (eventId !== undefined) headers['event-id'] = eventId;
     if (path === '/oauth/token') headers['Authorization'] = BASIC_AUTH;
 
-    const res = await fetch(url, { method, headers, body: payload });
-    const text = await res.text();
+    // One timeout covers connecting, the headers and the body; network failures and timeouts
+    // come out as SaicTransportError.
+    let res;
+    let text;
+    try {
+      res = await fetch(url, { method, headers, body: payload, signal: AbortSignal.timeout(this.requestTimeoutMs) });
+      text = await res.text();
+    } catch (err) {
+      const transport = classifyTransportError(err);
+      if (!transport) throw err;
+      this.log.debug(`[${method} ${path}] ${transport.message}${transport.notSent ? ' (request not sent)' : ''}`);
+      throw transport;
+    }
+    // The gateway itself failing or throttling: transient, but the request did reach it.
+    if (res.status >= 500 || res.status === 429) {
+      this.log.debug(`[${method} ${path}] HTTP ${res.status}`);
+      throw new SaicTransportError(`HTTP ${res.status} from the SAIC gateway`, `HTTP ${res.status}`, false, res.status);
+    }
 
     const sendDate = res.headers.get('app-send-date');
     const originalCt = res.headers.get('original-content-type');
@@ -201,8 +336,10 @@ export class SaicClient {
     );
 
     if (code === 401 || code === 403 || res.status === 401 || res.status === 403) {
-      this.token = '';
-      throw new SaicError(`Logged out: ${message}`, code);
+      // Only drop the token this request was sent with: another request may already have
+      // logged in again while this one was in flight.
+      if (this.token === tokenUsed) this.token = '';
+      throw new SaicError(`Logged out: ${message}`, code === 401 || code === 403 ? code : res.status);
     }
     // code 8 was originally left out of this list and fell through to the generic retry-with-
     // same-event-id path below. A real Homebridge log (see TESTING.md) showed that's wrong: a
@@ -227,7 +364,36 @@ export class SaicClient {
   }
 
   /** Retry loop for the asynchronous endpoints. Default timeout is generous for a cold car. */
-  async requestWithEventId(method, path, opts = {}, { timeoutMs = 60000 } = {}) {
+  /**
+   * Renews an expired session once, for a request that just got a 401/403, unless someone else
+   * already logged in again since it was sent. Rethrows the auth error without credentials.
+   */
+  async _recoverSession(authError, tokenBefore) {
+    if (this.token && this.token !== tokenBefore) return;
+    if (!this._credentials) throw authError;
+    this.log.info('SAIC session expired; logging in again once, then retrying the request.');
+    await this.login(this._credentials.username, this._credentials.password);
+  }
+
+  /** Runs fn; on a 401/403, renews the session once and runs it one more time. */
+  async _withSession(fn) {
+    const tokenBefore = this.token;
+    try {
+      return await fn();
+    } catch (err) {
+      if (!isAuthError(err)) throw err;
+      await this._recoverSession(err, tokenBefore);
+      return fn();
+    }
+  }
+
+  /**
+   * Retry loop for the asynchronous endpoints. Transient network failures: with an event id,
+   * keep polling the same id until the deadline (never re-send); before that, retry a GET
+   * with backoff; re-send a command (isCommand) only if the error proves it never left,
+   * otherwise throw SaicCommandOutcomeUnknown. See saic-client.ts for more.
+   */
+  async requestWithEventId(method, path, opts = {}, { timeoutMs = 60000, isCommand = false } = {}) {
     const deadline = Date.now() + timeoutMs;
     // Exponential backoff: 3s → 5s → 8s → 12s, capped at 15s. Reduces API
     // hammering on a sleeping car while staying fast for a responsive one.
@@ -241,42 +407,105 @@ export class SaicClient {
     // later." responses collapsing into that one uninformative line at warn level, with the
     // actual message visible only if debug logging happened to be on).
     let lastMessage = '';
+    // Transport failures before any event id was obtained (bounded by TRANSPORT_RETRY).
+    let initialFailures = 0;
+    // A 401/403 renews the session once per call (see _recoverSession), never more.
+    let sessionRenewed = false;
 
     while (Date.now() < deadline) {
       attempt++;
+      const tokenBefore = this.token;
       try {
         return await this.rawRequest(method, path, { ...opts, eventId });
       } catch (err) {
+        if (isAuthError(err) && !sessionRenewed) {
+          // Rejected for the session, not processed: renew it once and carry on (event id '0'
+          // re-sends the request, otherwise it keeps following the same event id).
+          sessionRenewed = true;
+          await this._recoverSession(err, tokenBefore);
+          continue;
+        }
+        if (err instanceof SaicTransportError) {
+          lastMessage = err.message;
+          if (eventId !== '0') {
+            // Already accepted by the gateway: keep asking about the same event id.
+            const wait = BACKOFF[Math.min(attempt - 1, BACKOFF.length - 1)];
+            this.log.debug(`[${method} ${path}] ${err.message} while waiting on event ${eventId}, `
+              + `asking again in ${wait / 1000}s.`);
+            await this._sleep(wait);
+            continue;
+          }
+          const safeToResend = err.notSent || (!isCommand && method === 'GET');
+          if (!safeToResend) {
+            if (!isCommand) throw err;
+            throw new SaicCommandOutcomeUnknown(
+              `Outcome unknown: ${err.message} after the command was sent, so it may or may not have `
+              + 'reached the car. Not re-sent.', 0,
+            );
+          }
+          initialFailures++;
+          if (initialFailures >= TRANSPORT_RETRY.attempts) throw err;
+          const wait = this._backoffDelay(initialFailures);
+          this.log.debug(`[${method} ${path}] ${err.message}${err.notSent ? ' (not sent)' : ''}, `
+            + `retrying in ${(wait / 1000).toFixed(1)}s.`);
+          await this._sleep(wait);
+          continue;
+        }
         if (!(err instanceof SaicRetry)) throw err;
         eventId = err.eventId;
         lastMessage = err.message;
         const wait = BACKOFF[Math.min(attempt - 1, BACKOFF.length - 1)];
         this.log.debug(`waiting for the car (attempt ${attempt}, ${wait / 1000}s)...`);
-        await sleep(wait);
+        await this._sleep(wait);
       }
     }
-    throw new SaicError(
-      `Timed out after ${timeoutMs / 1000}s waiting for the vehicle`
-      + (lastMessage ? ` (the car's last response was: ${lastMessage})` : ''),
-      408,
-    );
+    const timedOut = `Timed out after ${timeoutMs / 1000}s waiting for the vehicle`
+      + (lastMessage ? ` (the car's last response was: ${lastMessage})` : '');
+    if (isCommand && eventId !== '0') {
+      throw new SaicCommandOutcomeUnknown(
+        `${timedOut}. The gateway had accepted the command, so it may still have reached the car.`, 408,
+      );
+    }
+    throw new SaicError(timedOut, 408);
   }
 
   async login(username, password) {
+    this._credentials = { username, password };
     // Gate: if a login is already in flight (e.g. two parallel 401s), piggyback
     // onto it instead of making a second simultaneous call.
     if (this._loginPromise) return this._loginPromise;
 
+    // Pause after logins the gateway refused (see LOGIN_COOLDOWN); network failures don't count.
+    const pause = this._loginBlockedUntil - Date.now();
+    if (pause > 0) {
+      throw new SaicError(
+        `Not logging in again for another ${Math.ceil(pause / 1000)} s after ${this._loginFailures} `
+        + 'refused login(s) in a row (SAIC has been seen pausing accounts that log in too often).', 0,
+      );
+    }
+
     this._loginPromise = this._doLogin(username, password);
     try {
-      return await this._loginPromise;
+      const data = await this._loginPromise;
+      this._loginFailures = 0;
+      this._loginBlockedUntil = 0;
+      return data;
+    } catch (err) {
+      if (!(err instanceof SaicTransportError)) {
+        this._loginFailures++;
+        this._loginBlockedUntil = Date.now()
+          + Math.min(LOGIN_COOLDOWN.maxMs, LOGIN_COOLDOWN.baseMs * 2 ** (this._loginFailures - 1));
+      }
+      throw err;
     } finally {
       this._loginPromise = null;
     }
   }
 
+
   async _doLogin(username, password) {
-    const data = await this.rawRequest('POST', '/oauth/token', {
+    // Safe to repeat on a network failure: a second login just replaces the session.
+    const data = await this._withTransportRetries('login', () => this.rawRequest('POST', '/oauth/token', {
       formBody: {
         grant_type: 'password',
         username,
@@ -287,7 +516,7 @@ export class SaicClient {
         language: 'EN',
         loginType: username.includes('@') ? '2' : '1',
       },
-    });
+    }));
 
     const token = data.access_token ?? data.accessToken;
     if (!token) throw new SaicError('No access token returned. Check your credentials.', 401);
@@ -307,7 +536,7 @@ export class SaicClient {
   }
 
   vehicleList() {
-    return this.rawRequest('GET', '/vehicle/list');
+    return this._withTransportRetries('vehicle list', () => this._withSession(() => this.rawRequest('GET', '/vehicle/list')));
   }
 
   /** VIN must be hashed. Sending it raw returns the misleading error 36805. */
@@ -315,6 +544,17 @@ export class SaicClient {
     return this.requestWithEventId('GET', '/vehicle/status', {
       params: { vin: this._vinHash(vin), vehStatusReqType: '2' },
     });
+  }
+
+  /**
+   * The last status SAIC stored for the car, read WITHOUT waking it (GET /vehicle/status/cache,
+   * plain request, subset of basicVehicleStatus + statusTime). See saic-client.ts.
+   */
+  vehicleStatusCached(vin) {
+    return this._withTransportRetries('status cache', () => this._withSession(() =>
+      this.rawRequest('GET', '/vehicle/status/cache', {
+        params: { vin: this._vinHash(vin), vehStatusReqType: '2' },
+      })));
   }
 
   chargingStatus(vin) {
@@ -339,11 +579,18 @@ export class SaicClient {
    * instead of timing out.
    */
   vehicleControl(vin, { rvcReqType, rvcParams = null }) {
-    return this._enqueueControl(() =>
-      this.requestWithEventId('POST', '/vehicle/control', {
-        jsonBody: { rvcReqType, rvcParams, vin: this._vinHash(vin) },
-      }),
-    );
+    return this._enqueueControl(async () => {
+      try {
+        const result = await this.requestWithEventId('POST', '/vehicle/control', {
+          jsonBody: { rvcReqType, rvcParams, vin: this._vinHash(vin) },
+        }, { isCommand: true });
+        this.onControlSettled?.('ok');
+        return result;
+      } catch (err) {
+        this.onControlSettled?.(err instanceof SaicCommandOutcomeUnknown ? 'unknown' : 'failed', err);
+        throw err;
+      }
+    });
   }
 
   lockVehicle(vin) {

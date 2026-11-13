@@ -1,8 +1,15 @@
 import { SaicClient, SaicError } from './saic-client.js';
 import { MgSaicAccessory, climateTemperatureRange } from './accessory.js';
+import { OutageLog } from './outage.js';
 
 const PLUGIN_NAME = 'homebridge-mg-saic';
 const PLATFORM_NAME = 'MgSaic';
+
+// After consecutive failed polls the interval doubles (from the 2nd failure on), up to this
+// many times the configured interval, and snaps back on the first success.
+export const POLL_BACKOFF_MAX_FACTOR = 4;
+// Sensors show StatusFault once the last good status read is older than this many intervals.
+export const STALE_AFTER_POLL_INTERVALS = 3;
 
 export class MgSaicPlatform {
   /**
@@ -15,6 +22,10 @@ export class MgSaicPlatform {
     this.config = config;
     this.api = api;
     this.accessories = [];
+    // Set while a poll runs, so a tick that comes due meanwhile is skipped.
+    this._pollInFlight = false;
+    // First failure of a streak at warn, the rest at debug, the recovery once at info.
+    this.outage = new OutageLog(log, 'SAIC API');
 
     if (!config?.username) {
       this.log.warn('No username configured, MG SAIC platform will not start.');
@@ -51,6 +62,13 @@ export class MgSaicPlatform {
     this.enableRearHeatedSeats = config.enableRearHeatedSeats ?? false;
     // MG S6 EV power tailgate, exposed as a GarageDoorOpener; not yet confirmed by this plugin.
     this.enablePowerTailgate = config.enablePowerTailgate ?? false;
+    // Experimental, off by default: routine polls read SAIC's status cache, which doesn't wake
+    // the car. See useStatusCache in accessory.ts.
+    this.useStatusCache = config.useStatusCache ?? false;
+    if (this.useStatusCache) {
+      this.log.info('useStatusCache is on (experimental): routine polls read the status SAIC has stored '
+        + 'instead of waking the car; the full status is still read after commands and when fields are missing.');
+    }
     this.configuredVin = config.vin;
 
     this.client = new SaicClient(this.region, { log: this.log });
@@ -155,6 +173,8 @@ export class MgSaicPlatform {
       // Validated (1-3, default 3) by the accessory, which logs a warning if it's off.
       frontSeatHeatLevel: this.config.frontSeatHeatLevel,
       enablePowerTailgate: this.enablePowerTailgate,
+      staleAfterMs: this.pollIntervalMs * STALE_AFTER_POLL_INTERVALS,
+      useStatusCache: this.useStatusCache,
     });
 
     // The accessory constructor above adds or reuses services according to the current
@@ -168,39 +188,67 @@ export class MgSaicPlatform {
     }
   }
 
-  startPolling() {
-    const poll = async () => {
-      if (!this.vehicle) return;
-
-      // Ensure we are logged in before polling. If the token has been cleared
-      // by a 401/403 response, re-login here rather than waiting for the next
-      // tick so the very next poll still gets fresh data.
+  /**
+   * One poll: log in again if needed, then refresh the vehicle. Never runs twice at once.
+   * Failures go through the outage log and drive the backoff in nextPollDelay().
+   */
+  async pollOnce() {
+    if (!this.vehicle) return;
+    if (this._pollInFlight) {
+      this.log.debug('Previous poll still running - skipping this one.');
+      return;
+    }
+    this._pollInFlight = true;
+    try {
       if (!this.client.isLoggedIn) {
         try {
           await this.client.login(this.config.username, this.password);
           this.log.info('Re-logged in to the SAIC gateway.');
         } catch (err) {
-          this.log.warn(`Re-login failed: ${err.message}`);
+          this.outage.failure(`login failed: ${err.message}`);
           return;
         }
       }
 
       try {
-        await this.vehicle.refresh();
+        const ok = await this.vehicle.refresh();
+        if (ok) this.outage.success();
+        else this.outage.failure(`status refresh failed: ${this.vehicle.lastStatusError ?? 'unknown error'}`);
       } catch (err) {
-        // If the refresh itself surfaced a 401/403 (token expired mid-poll),
-        // clear the token so the next poll cycle re-logs in automatically.
+        // A 401/403 the client's one renewal didn't fix: clear the token, log in next poll.
         if (err instanceof SaicError && (err.code === 401 || err.code === 403)) {
-          this.log.warn('Session expired during refresh — will re-login on next poll.');
           this.client.token = '';
+          this.outage.failure('session expired during refresh, will log in again on the next poll');
         } else {
-          this.log.warn(`Refresh failed: ${err.message}`);
+          this.outage.failure(err.message);
         }
       }
-    };
-
-    // First poll shortly after startup, then on the configured interval.
-    setTimeout(poll, 10_000);
-    setInterval(poll, this.pollIntervalMs);
+    } finally {
+      this._pollInFlight = false;
+    }
   }
+
+  /** The configured interval, doubled per failed poll from the 2nd one on, capped. */
+  nextPollDelay() {
+    const failures = this.outage.consecutiveFailures;
+    if (failures <= 1) return this.pollIntervalMs;
+    return Math.min(this.pollIntervalMs * 2 ** (failures - 1), this.pollIntervalMs * POLL_BACKOFF_MAX_FACTOR);
+  }
+
+  startPolling() {
+    // A chain of timeouts rather than setInterval: the next poll is only scheduled once the
+    // previous one has finished, with the backoff applied.
+    const loop = async () => {
+      await this.pollOnce();
+      const delay = this.nextPollDelay();
+      if (delay !== this.pollIntervalMs) {
+        this.log.debug(`Next poll in ${Math.round(delay / 60_000)} min (backing off after `
+          + `${this.outage.consecutiveFailures} failed polls).`);
+      }
+      this._pollTimer = setTimeout(() => void loop(), delay);
+    };
+    // First poll shortly after startup, then on the configured interval.
+    this._pollTimer = setTimeout(() => void loop(), 10_000);
+  }
+
 }

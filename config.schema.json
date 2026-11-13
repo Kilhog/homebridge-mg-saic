@@ -142,6 +142,12 @@
         "type": "boolean",
         "default": false,
         "description": "For cars with a power tailgate (e.g. MG S6 EV): open and close it from HomeKit. Exposed as a GarageDoorOpener rather than a Switch, so HomeKit treats it as a secure accessory and asks for confirmation before automations or Siri move it. Reads open/closed from the boot status, so it also shows Open when the boot was opened by hand. Not yet confirmed against real hardware by this plugin. Off by default, see TESTING.md."
+      },
+      "useStatusCache": {
+        "title": "Experimental: routine polls read SAIC's stored status instead of waking the car",
+        "type": "boolean",
+        "default": false,
+        "description": "Not yet tried on a real car. Every routine poll normally calls /vehicle/status, which wakes the car (every 15 minutes by default, a 12 V battery concern). With this on, routine polls read /vehicle/status/cache, the last status SAIC stored, without waking it. The full status is still read on the first poll, after any command, and whenever the cache lacks a field an enabled service needs - in the one capture available, the cache has no door or temperature fields, so with door or temperature sensors enabled it falls back every time (the log says so once). See README.md."
       }
     }
   }

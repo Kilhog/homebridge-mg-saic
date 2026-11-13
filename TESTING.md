@@ -265,6 +265,14 @@ Worth recognising, because it looks alarming and isn't a plugin bug. If **every*
 
 This was observed for roughly 45 minutes straight, across several Homebridge restarts, and then cleared up on its own by the next morning with no code change. Restarting the bridge does not help and just starts a fresh 60s timeout cycle against a car that isn't answering — leave it alone for a while instead. Since 0.9.2 the timeout line quotes the car's last actual response, which makes this case easier to recognise than a bare "Timed out after 60s".
 
+Network outages (the plugin can't reach the gateway at all: `Network error: UND_ERR_CONNECT_TIMEOUT`, `ENOTFOUND`, `HTTP 503`...) are handled differently since the request-resilience changes: one `SAIC API unreachable: ...` warning, then debug-level lines only, polls spaced out up to 4× the interval, and one `SAIC API reachable again after N failed attempt(s) / X min` line when it comes back. To see it without touching the car, cut the Homebridge host's network (or block the gateway's host name) for a couple of poll intervals and restore it: the log should show exactly that sequence, the Home app should keep the last values, and once the outage lasts more than three intervals the door and temperature sensors should show a fault, clearing on the next good poll.
+
+A command that hits a network error after it was sent ends with `Outcome unknown: ...` in the log and is **not** repeated; 30 s later the plugin re-reads the car's state, so the tile settles on what the car actually did. Worth checking once on purpose: start a harmless command (rear defrost) and cut the network right after tapping it.
+
+## 7. Not waking the car on every poll (`useStatusCache`)
+
+Experimental, off by default, **not yet tried on a real car**. Turn it on with door and temperature sensors **off** (otherwise the cache lacks fields they need and every poll falls back to the full status — the log says so once). With debug logging on, the first poll should read `/vehicle/status`, the following ones `Status read from the SAIC cache (car not woken).` Check that the lock state still follows reality (lock the car with the key, wait for a poll) and, ideally, that the car no longer wakes up every 15 minutes (the iSmart app's "last updated" time, or the car's 12 V behaviour overnight). A control command should be followed by a full `/vehicle/status` read on the next poll.
+
 ## Known gaps at this stage
 
 - Pre-conditioning is now two separate HeaterCooler tiles, Cabin Heat and Cabin Cool (one slider each, 17–33 °C on an MG4, range per vehicle series otherwise), rather than one tile with a mode toggle. Cabin Cool's Active toggle is disabled — confirmed on real hardware to heat at maximum instead of cooling, see section 5. The **stop** path is still unexercised on either tile — see section 5.
