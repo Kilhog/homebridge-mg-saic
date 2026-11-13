@@ -39,6 +39,8 @@ export class MgSaicPlatform {
     this.enableHeatedSeats = config.enableHeatedSeats ?? false;
     this.enableRearDefrost = config.enableRearDefrost ?? false;
     this.enableFrontDefrost = config.enableFrontDefrost ?? false;
+    // MG S6 EV rear seats via the per-seat command, not yet confirmed by this plugin.
+    this.enableRearHeatedSeats = config.enableRearHeatedSeats ?? false;
     this.configuredVin = config.vin;
 
     this.client = new SaicClient(this.region, { log: this.log });
@@ -119,6 +121,9 @@ export class MgSaicPlatform {
       enableHeatedSeats: this.enableHeatedSeats,
       enableRearDefrost: this.enableRearDefrost,
       enableFrontDefrost: this.enableFrontDefrost,
+      enableRearHeatedSeats: this.enableRearHeatedSeats,
+      // Validated (1-3, default 3) by the accessory, which logs a warning if it's off.
+      frontSeatHeatLevel: this.config.frontSeatHeatLevel,
     });
 
     // The accessory constructor above adds or reuses services according to the current

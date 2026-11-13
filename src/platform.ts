@@ -20,6 +20,7 @@ export class MgSaicPlatform {
   private enableHeatedSeats: boolean;
   private enableRearDefrost: boolean;
   private enableFrontDefrost: boolean;
+  private enableRearHeatedSeats: boolean;
   private configuredVin: string | undefined;
 
   private client: SaicClient;
@@ -42,6 +43,7 @@ export class MgSaicPlatform {
       this.enableHeatedSeats        = false;
       this.enableRearDefrost        = false;
       this.enableFrontDefrost       = false;
+      this.enableRearHeatedSeats    = false;
       this.client = new SaicClient(this.region, { log });
       return;
     }
@@ -57,6 +59,7 @@ export class MgSaicPlatform {
       this.enableHeatedSeats        = false;
       this.enableRearDefrost        = false;
       this.enableFrontDefrost       = false;
+      this.enableRearHeatedSeats    = false;
       this.client = new SaicClient(this.region, { log });
       return;
     }
@@ -73,6 +76,8 @@ export class MgSaicPlatform {
     this.enableHeatedSeats  = (config['enableHeatedSeats']  as boolean | undefined) ?? false;
     this.enableRearDefrost  = (config['enableRearDefrost']  as boolean | undefined) ?? false;
     this.enableFrontDefrost = (config['enableFrontDefrost'] as boolean | undefined) ?? false;
+    // MG S6 EV rear seats via the per-seat command, not yet confirmed by this plugin.
+    this.enableRearHeatedSeats = (config['enableRearHeatedSeats'] as boolean | undefined) ?? false;
     this.configuredVin      = config['vin'] as string | undefined;
 
     this.client = new SaicClient(this.region, { log });
@@ -157,6 +162,9 @@ export class MgSaicPlatform {
       enableHeatedSeats:        this.enableHeatedSeats,
       enableRearDefrost:        this.enableRearDefrost,
       enableFrontDefrost:       this.enableFrontDefrost,
+      enableRearHeatedSeats:    this.enableRearHeatedSeats,
+      // Validated (1-3, default 3) by the accessory, which logs a warning if it's off.
+      frontSeatHeatLevel:       this.config['frontSeatHeatLevel'],
     });
 
     // The accessory constructor above adds or reuses services according to the current

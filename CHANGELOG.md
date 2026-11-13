@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here. This project doesn't yet follow strict semantic versioning guarantees while it's pre-1.0, breaking config changes are called out explicitly below when they happen.
 
+## Unreleased
+
+- **Added rear heated seat switches** (`enableRearHeatedSeats`, off by default, **not yet confirmed against real hardware by this plugin**): "Rear left seat heat" and "Rear right seat heat". They use `saic-python-client-ng`'s per-seat `control_heated_seat`: `rvcReqType "5"` with a single param (25 rear left, 26 rear right) plus the param 255 terminator, so one rear seat never restates the other. Rear seats are on/off only; On sends 3 (`REAR_HEATED_SEAT_ON_LEVEL`, what the iSmart app sends). State is read from `secondRowLeftSeatHeatLevel` / `secondRowRightSeatHeatLevel` and patched optimistically after a command.
+- **Added `frontSeatHeatLevel`** (1–3, default 3): the level the front seat heat switches send for On. The front seats keep the two-seat command confirmed on an MG4; with the default nothing changes on the wire. An invalid value falls back to 3 with a warning.
+
 ## 0.9.10
 
 - **Added a lock-triggered rapid refresh sequence to catch a plug-in faster after arriving home.** When the car's lockStatus transitions from unlocked to locked and the charger isn't already known to be plugged in, the plugin now fires a short burst of extra polls — 1, 3, 7, 15 and 25 minutes after the lock, cumulative — instead of waiting for the next scheduled poll (which can be a long way off on a relaxed `pollIntervalMs`) or for the charging-skip streak (see 0.9.8) to run out. Each step forces a real charging check regardless of the skip streak, and the sequence stops as soon as a plug-in is seen. Ported from `mg-saic-ha`'s post-shutdown refresh sequence (lock-engaged trigger); its message-queue-driven event refresh (engine start/stop detection) was not ported — a bigger undertaking with less clear payoff for this plugin's simpler polling model.

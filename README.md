@@ -21,6 +21,7 @@ Exposes one MG EV as one HomeKit accessory with:
 - **Outlet** — charging cable plugged in (`On`) and actively drawing (`InUse`)
 - **TemperatureSensor** × 2 — interior and exterior temperature. Falls back to the last known good reading and flags `StatusFault` if the API returns an unavailable-field sentinel instead of a real value
 - **Switch** × 2 — heated seats, left and right (off by default, see below)
+- **Switch** × 2 — rear heated seats, rear left and rear right (off by default, MG S6 EV control from the reference client, not yet confirmed against real hardware, see below)
 - **Switch** — rear window defrost (off by default, see below)
 - **Switch** — front window defrost (off by default, not yet confirmed against real hardware, see below)
 
@@ -49,6 +50,10 @@ Stopping either tile has not been exercised yet against real hardware.
 It's also the one control that's easy to overlook: it's governed by `enablePreconditioning` in config, and if that's off you get no tile in the Home app at all. Since 0.9.3 the startup log lists which services were exposed and which were left out, so you can check at a glance.
 
 **Front window defrost is a separate Switch (`enableFrontDefrost`, off by default, not yet confirmed against real hardware)** — added in 0.9.9. Unlike rear defrost it has no dedicated status field on the car: turning it on sends the same climate command as Cabin Heat/Cool but with fan speed 5 instead of 2 (the exact combination confirmed correct by `mg-saic-client`'s own `start_front_defrost`, ported from decrypted iSmart traffic), fixed at 22 °C, and mirrors Active=INACTIVE onto both Cabin Heat and Cabin Cool since all three share the one climate system. Turning it off sends the general stop-climate command. Its On/Off state in HomeKit only reflects what was last commanded, not a value read back from the car, and won't survive a Homebridge restart — reasonable given the car auto-cancels defrost on its own after roughly 10 minutes. If you test it against real hardware, an issue or PR reporting the result is very welcome.
+
+**Rear heated seats are two more Switches (`enableRearHeatedSeats`, off by default, not yet confirmed against real hardware by this plugin)** — for cars that have them, such as the MG S6 EV. They use the reference client's per-seat `control_heated_seat`: `rvcReqType "5"` with a single param (25 rear left, 26 rear right), so changing one rear seat never restates the other. Rear seats are on/off only; On sends 3, what the iSmart app sends. State is read from `secondRowLeftSeatHeatLevel` / `secondRowRightSeatHeatLevel`.
+
+The front seats keep the two-seat command confirmed on an MG4. **`frontSeatHeatLevel`** (1, 2 or 3, default 3) picks the level a front switch's On sends; 3 is what every version before this option sent. Because both front seats go in one request, a front seat that's already on is restated at this level too.
 
 **Window open/close was tried and does not work.** Same request shape as the reference client, byte-verified, but the car consistently rejects it with `code 8`, `"Request failed. Please check the vehicle status and try again."`, whether the car was locked, unlocked with the driver's door held open, or freshly started, all tried against the same MG4 (SWi165 - R11, Australia). There's no config option or switch for it; the low-level `controlWindow`/`WINDOW_ID` request is still in `src/saic-client.js` for reference, unused, in case a firmware update or a different vehicle ever behaves differently. See `CHANGELOG.md`.
 
@@ -81,6 +86,8 @@ Via Homebridge Config UI X (the plugin ships a `config.schema.json`, which drive
       "enableDoorSensors": true,
       "enableTemperatureSensors": true,
       "enableHeatedSeats": false,
+      "frontSeatHeatLevel": 3,
+      "enableRearHeatedSeats": false,
       "enableRearDefrost": false,
       "enableFrontDefrost": false
     }

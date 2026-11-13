@@ -102,6 +102,7 @@ function makeAccessory(overrides = {}) {
     startClimate: vi.fn(),
     stopClimate: vi.fn(),
     startFrontDefrost: vi.fn(),
+    controlHeatedSeat: vi.fn(),
   };
 
   const api = {
@@ -121,6 +122,7 @@ function makeAccessory(overrides = {}) {
     enableHeatedSeats: true,
     enableRearDefrost: true,
     enableFrontDefrost: true,
+    enableRearHeatedSeats: true,
     ...overrides,
   });
 
@@ -455,6 +457,72 @@ describe('setHeatActive clears front defrost', () => {
 });
 
 // ---------------------------------------------------------------------------
+// heated seats: front "on" level and rear seats
+// ---------------------------------------------------------------------------
+
+describe('setSeatHeat (front) - on level', () => {
+  it('sends 3 for on by default, exactly as before', async () => {
+    const { acc, client } = makeAccessory();
+    client.controlHeatedSeats.mockResolvedValue({});
+    await acc.setSeatHeat('left', true);
+    expect(client.controlHeatedSeats).toHaveBeenCalledWith('TESTVIN123', { leftLevel: 3, rightLevel: 0 });
+  });
+
+  it('sends the configured frontSeatHeatLevel for on, for the restated other seat too', async () => {
+    const { acc, client } = makeAccessory({ frontSeatHeatLevel: 2 });
+    client.controlHeatedSeats.mockResolvedValue({});
+    await acc.setSeatHeat('right', true);
+    expect(client.controlHeatedSeats).toHaveBeenLastCalledWith('TESTVIN123', { leftLevel: 0, rightLevel: 2 });
+    await acc.setSeatHeat('left', true);
+    expect(client.controlHeatedSeats).toHaveBeenLastCalledWith('TESTVIN123', { leftLevel: 2, rightLevel: 2 });
+  });
+
+  it('falls back to 3 with a warning when frontSeatHeatLevel is not 1-3', () => {
+    for (const level of [0, 4, 2.5, '2']) {
+      const { acc, log } = makeAccessory({ frontSeatHeatLevel: level });
+      expect(acc.frontSeatHeatLevel).toBe(3);
+      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('frontSeatHeatLevel'));
+    }
+  });
+});
+
+describe('setRearSeatHeat', () => {
+  it('reads each rear seat from its own secondRow field', () => {
+    const { acc } = makeAccessory();
+    acc._lastStatus = { basicVehicleStatus: { secondRowLeftSeatHeatLevel: 3, secondRowRightSeatHeatLevel: 0 } };
+    expect(acc.readSeatHeat('secondRowLeftSeatHeatLevel')).toBe(true);
+    expect(acc.readSeatHeat('secondRowRightSeatHeatLevel')).toBe(false);
+  });
+
+  it('sends one seat at a time (25 / 26), on = 3, and updates only that seat', async () => {
+    const { acc, client } = makeAccessory();
+    acc._lastStatus = { basicVehicleStatus: { secondRowRightSeatHeatLevel: 3 } };
+    client.controlHeatedSeat.mockResolvedValue({});
+    await acc.setRearSeatHeat('left', true);
+    expect(client.controlHeatedSeat).toHaveBeenCalledWith('TESTVIN123', 25, 3);
+    expect(acc._lastStatus.basicVehicleStatus)
+      .toEqual({ secondRowLeftSeatHeatLevel: 3, secondRowRightSeatHeatLevel: 3 });
+
+    await acc.setRearSeatHeat('right', false);
+    expect(client.controlHeatedSeat).toHaveBeenLastCalledWith('TESTVIN123', 26, 0);
+    expect(acc.readSeatHeat('secondRowRightSeatHeatLevel')).toBe(false);
+    expect(client.controlHeatedSeats).not.toHaveBeenCalled();
+  });
+
+  it('throws a HapStatusError and leaves state unchanged when the command fails', async () => {
+    const { acc, client } = makeAccessory();
+    client.controlHeatedSeat.mockRejectedValue(new Error('timeout'));
+    await expect(acc.setRearSeatHeat('left', true)).rejects.toThrow('HapStatusError');
+    expect(acc.readSeatHeat('secondRowLeftSeatHeatLevel')).toBe(false);
+  });
+
+  it('is listed in the startup services log', () => {
+    const { log } = makeAccessory({ enableRearHeatedSeats: true });
+    expect(log.info.mock.calls.map(([m]) => m).join('\n')).toMatch(/HomeKit services exposed:.*Rear heated seats/);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // setHeatTemperature / setCoolTemperature
 // ---------------------------------------------------------------------------
 
@@ -558,6 +626,7 @@ describe('logExposedServices', () => {
       enableHeatedSeats: false,
       enableRearDefrost: false,
       enableFrontDefrost: false,
+      enableRearHeatedSeats: false,
     });
     expect(lines(log)).toMatch(/HomeKit services exposed: Battery, Lock, Charging outlet\./);
   });
