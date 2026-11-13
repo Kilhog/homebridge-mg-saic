@@ -364,8 +364,25 @@ export class SaicClient {
     });
   }
 
+  /** Unlocks the tailgate only (releases its latch). A power tailgate opens with controlTailgate. */
   openTailgate(vin) {
     return this.unlockVehicle(vin, LOCK_ID.TAILGATE);
+  }
+
+  /**
+   * Opens or closes a power tailgate (the reference client's control_tailgate, from MG S6 EV
+   * traffic): rvcReqType "9", a single param 31 = 1 open / 2 close, and NO paramId 255
+   * terminator. bootStatus then reads 1 / 0. See saic-client.ts for the fuller version of
+   * this comment.
+   */
+  controlTailgate(vin, action) {
+    if (!Object.values(TAILGATE_ACTION).includes(action)) {
+      return Promise.reject(new RangeError(`Tailgate action must be 1 (open) or 2 (close), got ${action}`));
+    }
+    return this.vehicleControl(vin, {
+      rvcReqType: '9',
+      rvcParams: [{ paramId: 31, paramValue: b64([action]) }],
+    });
   }
 
   // -------------------------------------------------------- climate control
@@ -482,6 +499,9 @@ export class SaicClient {
 }
 
 export const LOCK_ID = { TAILGATE: 2, DOORS: 3 };
+
+/** paramId 31 values for controlTailgate (the reference client's TailgateAction). */
+export const TAILGATE_ACTION = { OPEN: 1, CLOSE: 2 };
 
 export const WINDOW_ID = { SUNROOF: 8, DRIVER: 9, WINDOW_2: 10, WINDOW_3: 11, WINDOW_4: 12 };
 
