@@ -123,6 +123,8 @@ On a Docker install (e.g. Homebridge on a NAS), the container's environment can'
 
 then set `"passwordFile": "/homebridge/.mg-saic-password"`. The password is read once at startup; only trailing line breaks are stripped. The precedence is `password`, then `passwordFile`, then `MG_SAIC_PASSWORD`. A `passwordFile` that is set but missing, unreadable or empty stops the platform with an error rather than falling back to the environment, and a file readable by other users is flagged in the log. The startup log says which source was used, never the password.
 
+Optional `accessoryName` field names the car accessory when it is first created; by default it takes the model name the account reports (e.g. `MG4 EV`, `MGS6 EV`), which is also shown as the accessory's model. An accessory restored from the Homebridge cache keeps its existing name, rename it in the Home app instead.
+
 Optional `vin` field pins the plugin to a specific vehicle if the account ever returns more than one; otherwise it uses the first vehicle the account returns.
 
 ## Polling

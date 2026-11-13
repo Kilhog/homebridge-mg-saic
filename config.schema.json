@@ -32,6 +32,13 @@
         "placeholder": "/homebridge/.mg-saic-password",
         "description": "Path to a file that holds only the password (owned by the Homebridge user, mode 600). Used when the password above is blank. Useful on Docker installs, where MG_SAIC_PASSWORD can't be set without recreating the container."
       },
+      "accessoryName": {
+        "title": "Accessory name",
+        "type": "string",
+        "required": false,
+        "placeholder": "MGS6 EV",
+        "description": "Name of the car accessory when it is first created. Defaults to the model name the account reports (e.g. MG4 EV, MGS6 EV). An existing accessory keeps its name; rename it in the Home app."
+      },
       "region": {
         "title": "Region",
         "type": "string",
