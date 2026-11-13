@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { SaicClient, SaicError } from '../src/saic-client.js';
+import { sentControl, VIN } from './control-payload.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -229,5 +230,23 @@ describe('isLoggedIn', () => {
     const client = makeClient();
     client.token = 'some-token';
     expect(client.isLoggedIn).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// heated steering wheel payload (rvcReqType "8")
+// ---------------------------------------------------------------------------
+
+describe('controlHeatedSteeringWheel payload', () => {
+  // Byte for byte what saic-python-client-ng's control_heated_steering_wheel sends
+  // (tests/test_heated_steering_wheel.py): param 24 = 1/0, then the 255 terminator.
+  it('sends rvcReqType 8 with param 24 = 1 to turn it on', async () => {
+    const body = await sentControl((c) => c.controlHeatedSteeringWheel(VIN, true));
+    expect(body).toEqual({ rvcReqType: '8', params: [[24, [1]], [255, [0, 0, 0, 0]]] });
+  });
+
+  it('sends rvcReqType 8 with param 24 = 0 to turn it off', async () => {
+    const body = await sentControl((c) => c.controlHeatedSteeringWheel(VIN, false));
+    expect(body).toEqual({ rvcReqType: '8', params: [[24, [0]], [255, [0, 0, 0, 0]]] });
   });
 });

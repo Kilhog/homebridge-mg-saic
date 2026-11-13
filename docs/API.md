@@ -209,6 +209,23 @@ Both seats are set in a single request, there's no way to change one without als
 
 Status is readable back from `basicVehicleStatus.rmtHtdRrWndSt` in `/vehicle/status`.
 
+### Heated steering wheel (`rvcReqType: "8"`)
+
+Ported from `saic-python-client-ng`'s `control_heated_steering_wheel` (`api/vehicle/climate`), byte for byte the request its own test checks (`tests/test_heated_steering_wheel.py`). **Not yet confirmed against real hardware by this plugin.**
+
+```json
+{
+  "rvcReqType": "8",
+  "rvcParams": [
+    { "paramId": 24,  "paramValue": "<AQ== on, AA== off>" },
+    { "paramId": 255, "paramValue": "AAAAAA==" }
+  ],
+  "vin": "<sha256 hex of VIN>"
+}
+```
+
+Per the reference client the car switches the heater off by itself after about 10 minutes. State is readable back from `basicVehicleStatus.steeringHeatLevel` (present in the reference client's MG S6 EV status capture). `basicVehicleStatus.steeringWheelHeatFailureReason` also exists, but the reference client only declares it; nobody has documented its values.
+
 ### Cabin pre-conditioning (`rvcReqType: "6"`)
 
 **The start command is confirmed working against a real MG4** (software version SWi165 - R11, Australia): `code: 0` with `failureType=0`, about 16 seconds and three polls after the request, having passed through two transient `code: 4` responses on the way. It physically ran the **heater**. The **stop** command has not been exercised yet.
@@ -346,6 +363,8 @@ Field names as returned by the API, decoded meaning based on a live capture:
 | `vehicleAlarmStatus` | Meaning not yet confirmed |
 | `frontLeftSeatHeatLevel`, `frontRightSeatHeatLevel` | `0` = off, drives the two heated seat Switches (off by default, confirmed working) |
 | `rmtHtdRrWndSt` | `0` = off, drives the rear defrost Switch (off by default, confirmed working) |
+| `steeringHeatLevel` | `0` = off, non-zero = on. Drives the heated steering wheel Switch (off by default, not yet confirmed) |
+| `steeringWheelHeatFailureReason` | Undocumented. `0` presumably means no failure; a non-zero value is logged as-is |
 | `driverWindow`, `passengerWindow`, `rearLeftWindow`, `rearRightWindow` | `0` = closed. Readable, but there's no writable Switch for these, see "Windows" above |
 
 ### `chrgMgmtData` (from `/vehicle/charging/mgmtData`)
