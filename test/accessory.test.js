@@ -36,6 +36,9 @@ function makeHap() {
     TargetHeaterCoolerState: { AUTO: 0, HEAT: 1, COOL: 2 },
     HeatingThresholdTemperature: {},
     CoolingThresholdTemperature: {},
+    Manufacturer: 'Manufacturer',
+    Model: 'Model',
+    SerialNumber: 'SerialNumber',
   };
 
   const makeService = () => ({
@@ -729,5 +732,23 @@ describe('lock-triggered rapid refresh sequence', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AccessoryInformation model
+// ---------------------------------------------------------------------------
+
+describe('AccessoryInformation model', () => {
+  it('uses the model name the account reports', () => {
+    const { acc } = makeAccessory({ model: 'MGS6 EV' });
+    const info = acc.accessory.getService('AccessoryInformation');
+    expect(info.setCharacteristic).toHaveBeenCalledWith('Model', 'MGS6 EV');
+    expect(acc.model).toBe('MGS6 EV');
+  });
+
+  it('falls back to MG4 when the model is unknown or blank', () => {
+    expect(makeAccessory().acc.model).toBe('MG4');
+    expect(makeAccessory({ model: '  ' }).acc.model).toBe('MG4');
   });
 });

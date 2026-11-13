@@ -102,6 +102,8 @@ const DOOR_FIELDS: [string, string][] = [
 
 export interface AccessoryOpts {
   vin: string;
+  /** Model name the account reports (e.g. "MGS6 EV"); "MG4" when unknown. */
+  model?: string;
   log: { info(m: string): void; warn(m: string): void; debug(m: string): void };
   api: API;
   enablePreconditioning: boolean;
@@ -122,6 +124,7 @@ export class MgSaicAccessory {
   private accessory: PlatformAccessory;
   private client: SaicClient;
   vin: string;
+  model: string;
   private log: AccessoryOpts['log'];
   private api: API;
   private Service: typeof Service;
@@ -182,12 +185,13 @@ export class MgSaicAccessory {
   private _frontDefrostActive = false;
 
   constructor(accessory: PlatformAccessory, client: SaicClient, {
-    vin, log, api, enablePreconditioning, enableDoorSensors, enableTemperatureSensors,
+    vin, model, log, api, enablePreconditioning, enableDoorSensors, enableTemperatureSensors,
     enableHeatedSeats, enableRearDefrost, enableFrontDefrost,
   }: AccessoryOpts) {
     this.accessory   = accessory;
     this.client      = client;
     this.vin         = vin;
+    this.model       = model?.trim() || 'MG4';
     this.log         = log;
     this.api         = api;
     this.Service         = api.hap.Service;
@@ -244,7 +248,7 @@ export class MgSaicAccessory {
       ?? this.accessory.addService(this.Service.AccessoryInformation);
     info
       .setCharacteristic(this.Characteristic.Manufacturer, 'MG')
-      .setCharacteristic(this.Characteristic.Model, 'MG4')
+      .setCharacteristic(this.Characteristic.Model, this.model)
       .setCharacteristic(this.Characteristic.SerialNumber, this.vin || 'unknown-vin');
   }
 

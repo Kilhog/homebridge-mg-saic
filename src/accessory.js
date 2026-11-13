@@ -91,12 +91,13 @@ export class MgSaicAccessory {
    * @param {{ vin: string, log: any, api: any, enablePreconditioning: boolean, enableDoorSensors: boolean, enableTemperatureSensors: boolean, enableHeatedSeats: boolean, enableRearDefrost: boolean, enableFrontDefrost: boolean }} opts
    */
   constructor(accessory, client, {
-    vin, log, api, enablePreconditioning, enableDoorSensors, enableTemperatureSensors,
+    vin, model, log, api, enablePreconditioning, enableDoorSensors, enableTemperatureSensors,
     enableHeatedSeats, enableRearDefrost, enableFrontDefrost,
   }) {
     this.accessory = accessory;
     this.client = client;
     this.vin = vin;
+    this.model = model?.trim() || 'MG4';
     this.log = log;
     this.api = api;
     this.Service = api.hap.Service;
@@ -184,7 +185,7 @@ export class MgSaicAccessory {
       ?? this.accessory.addService(this.Service.AccessoryInformation);
     info
       .setCharacteristic(this.Characteristic.Manufacturer, 'MG')
-      .setCharacteristic(this.Characteristic.Model, 'MG4')
+      .setCharacteristic(this.Characteristic.Model, this.model)
       .setCharacteristic(this.Characteristic.SerialNumber, this.vin || 'unknown-vin');
   }
 

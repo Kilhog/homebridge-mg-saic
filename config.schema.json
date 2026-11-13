@@ -25,6 +25,13 @@
         "required": false,
         "description": "Leave blank and set MG_SAIC_PASSWORD in the Homebridge environment instead, if possible."
       },
+      "accessoryName": {
+        "title": "Accessory name",
+        "type": "string",
+        "required": false,
+        "placeholder": "MGS6 EV",
+        "description": "Name of the car accessory when it is first created. Defaults to the model name the account reports (e.g. MG4 EV, MGS6 EV). An existing accessory keeps its name; rename it in the Home app."
+      },
       "region": {
         "title": "Region",
         "type": "string",

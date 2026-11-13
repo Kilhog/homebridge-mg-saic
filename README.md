@@ -90,6 +90,8 @@ Via Homebridge Config UI X (the plugin ships a `config.schema.json`, which drive
 
 Leave `password` out of `config.json` and instead set the `MG_SAIC_PASSWORD` environment variable for the Homebridge process, so the password isn't sitting in plain text on disk. If you do set `password` in config, be aware `config.json` is unencrypted.
 
+Optional `accessoryName` field names the car accessory when it is first created; by default it takes the model name the account reports (e.g. `MG4 EV`, `MGS6 EV`), which is also shown as the accessory's model. An accessory restored from the Homebridge cache keeps its existing name, rename it in the Home app instead.
+
 Optional `vin` field pins the plugin to a specific vehicle if the account ever returns more than one; otherwise it uses the first vehicle the account returns.
 
 ## Polling

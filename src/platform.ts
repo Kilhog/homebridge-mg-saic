@@ -132,23 +132,32 @@ export class MgSaicPlatform {
       this.log.info(`Vehicle series: ${matchedVehicle.series}${name ? ` (${name})` : ''}`);
     }
 
-    this.registerAccessory(vin);
+    this.registerAccessory(vin, matchedVehicle?.modelName);
     this.startPolling();
   }
 
-  registerAccessory(vin: string): void {
+  registerAccessory(vin: string, modelName?: string): void {
     const uuid = this.api.hap.uuid.generate(`mg-saic-${vin}`);
     let platformAccessory = this.accessories.find((a) => a.UUID === uuid);
 
+    // Named after the model the account reports (e.g. "MGS6 EV"), or accessoryName from
+    // config, instead of a hard-coded "MG4". Only applies when the accessory is created: a
+    // cached accessory keeps its name, since renaming it under an existing HomeKit pairing
+    // is the Home app's job.
+    const model = modelName?.trim() || 'MG4';
+    const configuredName = this.config['accessoryName'];
+    const displayName = (typeof configuredName === 'string' && configuredName.trim()) || model;
+
     const isNew = !platformAccessory;
     if (!platformAccessory) {
-      platformAccessory = new this.api.platformAccessory('MG4', uuid);
+      platformAccessory = new this.api.platformAccessory(displayName, uuid);
       this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [platformAccessory]);
       this.accessories.push(platformAccessory);
     }
 
     this.vehicle = new MgSaicAccessory(platformAccessory, this.client, {
       vin,
+      model,
       log:                    this.log,
       api:                    this.api,
       enablePreconditioning:    this.enablePreconditioning,
