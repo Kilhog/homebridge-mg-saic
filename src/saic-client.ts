@@ -113,6 +113,14 @@ export const REQUEST_TIMEOUT_MS = 20_000;
  */
 export const TRANSPORT_RETRY = { attempts: 4, baseDelayMs: 2_000, maxDelayMs: 10_000 };
 
+/**
+ * Pause before logging in again after a login the gateway itself refused (wrong password,
+ * account paused...): 1, 2, 4, 8 then 15 min. SAIC allows one session per account and has
+ * been seen pausing an account for ~15 min when it sees too many logins, so a stuck re-login
+ * loop must not hammer it. Network failures don't count, they never reached SAIC.
+ */
+export const LOGIN_COOLDOWN = { baseMs: 60_000, maxMs: 15 * 60_000 };
+
 /** Codes (on fetch's TypeError cause) that prove the request never reached the server. */
 const NOT_SENT_CODES = new Set(['UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
 /** Transient codes where the request may already have reached the server. */
@@ -193,6 +201,11 @@ export function classifyTransportError(err: unknown): SaicTransportError | null 
   return new SaicTransportError(`Network error: ${codes.join('/')}`, codes[0], notSent);
 }
 
+/** A logged-out response (401/403), as opposed to a network failure that happens to be 403-ish. */
+function isAuthError(err: unknown): boolean {
+  return err instanceof SaicError && !(err instanceof SaicTransportError) && (err.code === 401 || err.code === 403);
+}
+
 class SaicRetry extends Error {
   eventId: string;
   code: number;
@@ -223,6 +236,11 @@ export class SaicClient {
   private _controlQueue: Promise<void>;
   private _loginPromise: Promise<unknown> | null;
   private _vinHashCache: Map<string, string>;
+  // Kept from the last login() call so an expired session can be renewed once, mid-request.
+  private _credentials?: { username: string; password: string };
+  // Consecutive logins the gateway refused, and when the next attempt is allowed.
+  private _loginFailures = 0;
+  private _loginBlockedUntil = 0;
 
   constructor(region = 'Australia', { log, requestTimeoutMs = REQUEST_TIMEOUT_MS }: { log?: Logger; requestTimeoutMs?: number } = {}) {
     const r = REGIONS[region];
@@ -293,6 +311,7 @@ export class SaicClient {
     formBody, jsonBody, params, eventId,
   }: RawRequestOpts = {}): Promise<unknown> {
     const query       = params ? '?' + new URLSearchParams(params).toString() : '';
+    const tokenUsed   = this.token;
     const url         = this.baseUri + path.replace(/^\//, '') + query;
     const requestPath = url.replace(this.baseUri, '/');
     const ts          = String(Date.now());
@@ -387,8 +406,10 @@ export class SaicClient {
     );
 
     if (code === 401 || code === 403 || res.status === 401 || res.status === 403) {
-      this.token = '';
-      throw new SaicError(`Logged out: ${message}`, code !== -1 ? code : res.status);
+      // Only drop the token this request was sent with: another request may already have
+      // logged in again while this one was in flight.
+      if (this.token === tokenUsed) this.token = '';
+      throw new SaicError(`Logged out: ${message}`, code === 401 || code === 403 ? code : res.status);
     }
     // code 8 was originally left out of this list and fell through to the generic retry-with-
     // same-event-id path below. A real Homebridge log (see TESTING.md) showed that's wrong: a
@@ -410,6 +431,31 @@ export class SaicClient {
       throw new SaicError(message, code);
     }
     return data ?? json;
+  }
+
+  /**
+   * Renews an expired session once, for a request that just got a 401/403. Logs in again only
+   * if nobody else has since the request was sent (tokenBefore), so several requests failing
+   * together share one login (the _loginPromise gate covers the simultaneous case). Rethrows
+   * the auth error when no credentials are known yet.
+   */
+  async _recoverSession(authError: unknown, tokenBefore: string): Promise<void> {
+    if (this.token && this.token !== tokenBefore) return;
+    if (!this._credentials) throw authError;
+    this.log.info('SAIC session expired; logging in again once, then retrying the request.');
+    await this.login(this._credentials.username, this._credentials.password);
+  }
+
+  /** Runs fn; on a 401/403, renews the session once and runs it one more time. */
+  async _withSession<T>(fn: () => Promise<T>): Promise<T> {
+    const tokenBefore = this.token;
+    try {
+      return await fn();
+    } catch (err) {
+      if (!isAuthError(err)) throw err;
+      await this._recoverSession(err, tokenBefore);
+      return fn();
+    }
   }
 
   /**
@@ -443,12 +489,22 @@ export class SaicClient {
     let lastMessage = '';
     // Transport failures before any event id was obtained (bounded by TRANSPORT_RETRY).
     let initialFailures = 0;
+    // A 401/403 renews the session once per call (see _recoverSession), never more.
+    let sessionRenewed = false;
 
     while (Date.now() < deadline) {
       attempt++;
+      const tokenBefore = this.token;
       try {
         return await this.rawRequest(method, path, { ...opts, eventId });
       } catch (err) {
+        if (isAuthError(err) && !sessionRenewed) {
+          // Rejected for the session, not processed: renew it once and carry on - with event id
+          // '0' that re-sends the request, otherwise it keeps following the same event id.
+          sessionRenewed = true;
+          await this._recoverSession(err, tokenBefore);
+          continue;
+        }
         if (err instanceof SaicTransportError) {
           lastMessage = err.message;
           if (eventId !== '0') {
@@ -494,13 +550,32 @@ export class SaicClient {
   }
 
   async login(username: string, password: string): Promise<unknown> {
+    this._credentials = { username, password };
     // Gate: if a login is already in flight (e.g. two parallel 401s), piggyback
     // onto it instead of making a second simultaneous call.
     if (this._loginPromise) return this._loginPromise;
 
+    const pause = this._loginBlockedUntil - Date.now();
+    if (pause > 0) {
+      throw new SaicError(
+        `Not logging in again for another ${Math.ceil(pause / 1000)} s after ${this._loginFailures} `
+        + 'refused login(s) in a row (SAIC has been seen pausing accounts that log in too often).', 0,
+      );
+    }
+
     this._loginPromise = this._doLogin(username, password);
     try {
-      return await this._loginPromise;
+      const data = await this._loginPromise;
+      this._loginFailures = 0;
+      this._loginBlockedUntil = 0;
+      return data;
+    } catch (err) {
+      if (!(err instanceof SaicTransportError)) {
+        this._loginFailures++;
+        this._loginBlockedUntil = Date.now()
+          + Math.min(LOGIN_COOLDOWN.maxMs, LOGIN_COOLDOWN.baseMs * 2 ** (this._loginFailures - 1));
+      }
+      throw err;
     } finally {
       this._loginPromise = null;
     }
@@ -538,7 +613,7 @@ export class SaicClient {
   }
 
   vehicleList(): Promise<unknown> {
-    return this._withTransportRetries('vehicle list', () => this.rawRequest('GET', '/vehicle/list'));
+    return this._withTransportRetries('vehicle list', () => this._withSession(() => this.rawRequest('GET', '/vehicle/list')));
   }
 
   /** VIN must be hashed. Sending it raw returns the misleading error 36805. */

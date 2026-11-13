@@ -4,6 +4,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   SaicClient, SaicError, SaicTransportError, SaicCommandOutcomeUnknown, classifyTransportError, TRANSPORT_RETRY,
+  LOGIN_COOLDOWN,
 } from '../src/saic-client.js';
 import { MgSaicAccessory } from '../src/accessory.js';
 
@@ -367,5 +368,127 @@ describe('accessory: unknown command outcome', () => {
     const { acc, services, Characteristic } = makeAccessoryHarness(client);
     await expect(acc.setLockTarget(Characteristic.LockTargetState.SECURED)).rejects.toThrow('HapStatusError');
     expect(services.LockMechanism.updateCharacteristic).toHaveBeenLastCalledWith(Characteristic.LockCurrentState, 'JAMMED');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// session: one re-login per request, no login storms
+// ---------------------------------------------------------------------------
+
+describe('session renewal', () => {
+  const loggedOut = () => response({ code: 401, message: 'Token expired' });
+  const loginOk = (token) => response({ code: 0, data: { access_token: token } });
+  const paths = (fetchMock) => fetchMock.mock.calls.map(([url]) => new URL(url).pathname.replace('/api.app/v1', ''));
+
+  /** A client that has logged in once already, with fetch reset afterwards. */
+  async function loggedInClient(fetchMock) {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(loginOk('T1')));
+    const client = makeClient();
+    await client.login('user@example.com', 'secret');
+    vi.stubGlobal('fetch', fetchMock);
+    return client;
+  }
+
+  it('renews an expired session once and retries the request', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(loggedOut())
+      .mockResolvedValueOnce(loginOk('T2'))
+      .mockResolvedValue(response({ code: 0, data: { vinList: [] } }));
+    const client = await loggedInClient(fetchMock);
+    await expect(client.vehicleList()).resolves.toEqual({ vinList: [] });
+    expect(paths(fetchMock)).toEqual(['/vehicle/list', '/oauth/token', '/vehicle/list']);
+    expect(client.token).toBe('T2');
+  });
+
+  it('gives up after one renewal if the retried request is refused again', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(loggedOut())
+      .mockResolvedValueOnce(loginOk('T2'))
+      .mockResolvedValue(loggedOut());
+    const client = await loggedInClient(fetchMock);
+    await expect(client.vehicleList()).rejects.toMatchObject({ code: 401 });
+    expect(paths(fetchMock).filter((p) => p === '/oauth/token')).toHaveLength(1);
+  });
+
+  it('renews the session during a status poll and carries on', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(loggedOut())
+      .mockResolvedValueOnce(loginOk('T2'))
+      .mockResolvedValue(response({ code: 0, data: { basicVehicleStatus: {} } }));
+    const client = await loggedInClient(fetchMock);
+    await client.vehicleStatus('VIN');
+    expect(paths(fetchMock)).toEqual(['/vehicle/status', '/oauth/token', '/vehicle/status']);
+  });
+
+  it('re-sends a command refused for its session (it was never processed), once', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(loggedOut())
+      .mockResolvedValueOnce(loginOk('T2'))
+      .mockResolvedValue(response({ code: 0, data: { rvcReqSts: 2 } }));
+    const client = await loggedInClient(fetchMock);
+    await client.lockVehicle('VIN');
+    expect(paths(fetchMock)).toEqual(['/vehicle/control', '/oauth/token', '/vehicle/control']);
+  });
+
+  it('keeps following the same event id when the session expires mid-wait', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ code: 4, message: 'wait' }, { headers: { 'event-id': 'E1' } }))
+      .mockResolvedValueOnce(loggedOut())
+      .mockResolvedValueOnce(loginOk('T2'))
+      .mockResolvedValue(response({ code: 0, data: { rvcReqSts: 2 } }));
+    const client = await loggedInClient(fetchMock);
+    await client.lockVehicle('VIN');
+    const controlEventIds = fetchMock.mock.calls
+      .filter(([url]) => url.includes('/vehicle/control'))
+      .map(([, init]) => init.headers['event-id']);
+    expect(controlEventIds).toEqual(['0', 'E1', 'E1']);
+  });
+
+  it('shares one login between requests that get logged out together', async () => {
+    let loginCalls = 0;
+    const fetchMock = vi.fn(async (url, init) => {
+      if (url.includes('/oauth/token')) {
+        loginCalls++;
+        return loginOk('T2');
+      }
+      return init.headers['blade-auth'] === 'T2' ? response({ code: 0, data: { ok: true } }) : loggedOut();
+    });
+    const client = await loggedInClient(fetchMock);
+    await Promise.all([client.vehicleList(), client.vehicleList(), client.vehicleStatus('VIN')]);
+    expect(loginCalls).toBe(1);
+  });
+
+  it('does not log in again for a request that was sent before someone else already did', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({ code: 0, data: { ok: true } }));
+    const client = await loggedInClient(fetchMock);
+    client.token = 'T2'; // another request renewed the session meanwhile
+    client.login = vi.fn();
+    await client._recoverSession(new SaicError('Logged out', 401), 'T1');
+    expect(client.login).not.toHaveBeenCalled();
+  });
+
+  it('pauses logins after the gateway refuses one, with a growing cooldown', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockResolvedValue(response({ code: 3, message: 'Wrong password' }));
+    vi.stubGlobal('fetch', fetchMock);
+    const client = makeClient();
+    await expect(client.login('u@example.com', 'bad')).rejects.toThrow('Wrong password');
+    await expect(client.login('u@example.com', 'bad')).rejects.toThrow(/Not logging in again/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    vi.advanceTimersByTime(LOGIN_COOLDOWN.baseMs);
+    await expect(client.login('u@example.com', 'bad')).rejects.toThrow('Wrong password');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    vi.advanceTimersByTime(LOGIN_COOLDOWN.baseMs); // second refusal doubled the pause
+    await expect(client.login('u@example.com', 'bad')).rejects.toThrow(/Not logging in again/);
+  });
+
+  it('does not pause logins after a network failure (it never reached SAIC)', async () => {
+    const fetchMock = vi.fn().mockRejectedValue(fetchFailed('UND_ERR_CONNECT_TIMEOUT'));
+    vi.stubGlobal('fetch', fetchMock);
+    const client = makeClient();
+    await expect(client.login('u@example.com', 'pw')).rejects.toBeInstanceOf(SaicTransportError);
+    fetchMock.mockResolvedValue(loginOk('T1'));
+    await expect(client.login('u@example.com', 'pw')).resolves.toBeDefined();
   });
 });
