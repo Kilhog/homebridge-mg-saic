@@ -472,6 +472,8 @@ export class SaicClient {
   // resurrecting this, WINDOW_ID.DRIVER is the one confirmed-correct mapping (both the reference
   // client and this project's own /vehicle/status capture call it "driver"), WINDOW_2/3/4 were
   // never confirmed since the base command never worked.
+  //
+  // The MG S6 EV uses a different form of the same rvcReqType "3": see controlDoorWindows below.
 
   controlWindow(vin, windowId, { open }) {
     const allWindowIds = [WINDOW_ID.SUNROOF, WINDOW_ID.DRIVER, WINDOW_ID.WINDOW_2, WINDOW_ID.WINDOW_3, WINDOW_ID.WINDOW_4];
@@ -479,11 +481,38 @@ export class SaicClient {
     rvcParams.push({ paramId: 13, paramValue: b64([open ? 3 : 0]) });
     return this.vehicleControl(vin, { rvcReqType: '3', rvcParams });
   }
+
+  /**
+   * All four door windows at once, MG S6 EV format (the reference client's
+   * control_door_windows): rvcReqType "3", sunroof (8) = 0, door windows 9-12 = 1, action in
+   * 13 (0 close, 1 ventilate, 2 fully open), and NO paramId 255 terminator. Full open is
+   * confirmed on a real MG S6 EV (Europe, LHD); close and ventilate are not yet. See
+   * saic-client.ts for the fuller version of this comment.
+   */
+  controlDoorWindows(vin, action) {
+    if (!Object.values(DOOR_WINDOWS_ACTION).includes(action)) {
+      return Promise.reject(new RangeError(`Door windows action must be 0 (close), 1 (ventilate) or 2 (open), got ${action}`));
+    }
+    return this.vehicleControl(vin, {
+      rvcReqType: '3',
+      rvcParams: [
+        { paramId: 8, paramValue: b64([0]) },
+        { paramId: 9, paramValue: b64([1]) },
+        { paramId: 10, paramValue: b64([1]) },
+        { paramId: 11, paramValue: b64([1]) },
+        { paramId: 12, paramValue: b64([1]) },
+        { paramId: 13, paramValue: b64([action]) },
+      ],
+    });
+  }
 }
 
 export const LOCK_ID = { TAILGATE: 2, DOORS: 3 };
 
 export const WINDOW_ID = { SUNROOF: 8, DRIVER: 9, WINDOW_2: 10, WINDOW_3: 11, WINDOW_4: 12 };
+
+/** paramId 13 values for controlDoorWindows (the reference client's DoorWindowsAction). */
+export const DOOR_WINDOWS_ACTION = { CLOSE: 0, VENTILATE: 1, OPEN: 2 };
 
 function b64(bytes) {
   return Buffer.from(bytes).toString('base64');

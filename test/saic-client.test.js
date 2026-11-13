@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { SaicClient, SaicError } from '../src/saic-client.js';
+import { SaicClient, SaicError, DOOR_WINDOWS_ACTION, WINDOW_ID } from '../src/saic-client.js';
+import { sentControl, VIN } from './control-payload.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -229,5 +230,40 @@ describe('isLoggedIn', () => {
     const client = makeClient();
     client.token = 'some-token';
     expect(client.isLoggedIn).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// door windows payload, MG S6 EV format (rvcReqType "3")
+// ---------------------------------------------------------------------------
+
+describe('controlDoorWindows payload', () => {
+  // Byte for byte what saic-python-client-ng's control_door_windows sends
+  // (tests/test_door_windows.py): sunroof 0, the four door windows 1, then the action,
+  // and NO 255 terminator.
+  for (const [name, action] of [['CLOSE', 0], ['VENTILATE', 1], ['OPEN', 2]]) {
+    it(`sends action ${action} (${name}) for all four door windows, without param 255`, async () => {
+      expect(DOOR_WINDOWS_ACTION[name]).toBe(action);
+      const body = await sentControl((c) => c.controlDoorWindows(VIN, action));
+      expect(body).toEqual({
+        rvcReqType: '3',
+        params: [[8, [0]], [9, [1]], [10, [1]], [11, [1]], [12, [1]], [13, [action]]],
+      });
+    });
+  }
+
+  it('refuses an unknown action instead of sending it', async () => {
+    const client = makeClient();
+    client.requestWithEventId = vi.fn();
+    await expect(client.controlDoorWindows(VIN, 3)).rejects.toThrow(RangeError);
+    expect(client.requestWithEventId).not.toHaveBeenCalled();
+  });
+
+  it('leaves the MG4-era controlWindow unchanged (open is still 3)', async () => {
+    const body = await sentControl((c) => c.controlWindow(VIN, WINDOW_ID.DRIVER, { open: true }));
+    expect(body).toEqual({
+      rvcReqType: '3',
+      params: [[8, [0]], [9, [1]], [10, [0]], [11, [0]], [12, [0]], [13, [3]]],
+    });
   });
 });
