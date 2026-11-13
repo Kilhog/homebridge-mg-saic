@@ -1,6 +1,7 @@
 import type { API, PlatformAccessory, Logging, PlatformConfig } from 'homebridge';
 import { SaicClient, SaicError } from './saic-client.js';
 import { MgSaicAccessory } from './accessory.js';
+import { resolvePassword } from './password.js';
 
 const PLUGIN_NAME   = 'homebridge-mg-saic';
 const PLATFORM_NAME = 'MgSaic';
@@ -46,9 +47,11 @@ export class MgSaicPlatform {
       return;
     }
 
-    this.password = (config['password'] as string | undefined) || process.env['MG_SAIC_PASSWORD'] || '';
+    const resolvedPassword = resolvePassword(config, this.log);
+    this.password = resolvedPassword?.password ?? '';
+    if (resolvedPassword) this.log.info(`Using the iSmart password from ${resolvedPassword.source}.`);
     if (!this.password) {
-      this.log.warn('No password configured (config.password or MG_SAIC_PASSWORD env var), MG SAIC platform will not start.');
+      this.log.warn('No password configured (config.password, config.passwordFile or MG_SAIC_PASSWORD env var), MG SAIC platform will not start.');
       this.region               = 'Australia';
       this.pollIntervalMs       = 900_000;
       this.enablePreconditioning    = false;

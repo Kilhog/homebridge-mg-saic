@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented here. This project doesn't yet follow strict semantic versioning guarantees while it's pre-1.0, breaking config changes are called out explicitly below when they happen.
 
+## Unreleased
+
+- **Added a `passwordFile` option** for Docker-based installs (e.g. Homebridge on a NAS), where `MG_SAIC_PASSWORD` can't be set without recreating the container and `config.json` is often world-readable. It names a file holding only the password (mode 600); only trailing line breaks are stripped. Precedence is `password`, then `passwordFile`, then `MG_SAIC_PASSWORD`. A configured file that is missing, unreadable or empty stops the platform with an error instead of silently falling back, a file readable by other users is flagged with a warning, and the startup log names the source used, never the password.
+
 ## 0.9.10
 
 - **Added a lock-triggered rapid refresh sequence to catch a plug-in faster after arriving home.** When the car's lockStatus transitions from unlocked to locked and the charger isn't already known to be plugged in, the plugin now fires a short burst of extra polls — 1, 3, 7, 15 and 25 minutes after the lock, cumulative — instead of waiting for the next scheduled poll (which can be a long way off on a relaxed `pollIntervalMs`) or for the charging-skip streak (see 0.9.8) to run out. Each step forces a real charging check regardless of the skip streak, and the sequence stops as soon as a plug-in is seen. Ported from `mg-saic-ha`'s post-shutdown refresh sequence (lock-engaged trigger); its message-queue-driven event refresh (engine start/stop detection) was not ported — a bigger undertaking with less clear payoff for this plugin's simpler polling model.

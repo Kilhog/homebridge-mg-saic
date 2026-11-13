@@ -90,6 +90,14 @@ Via Homebridge Config UI X (the plugin ships a `config.schema.json`, which drive
 
 Leave `password` out of `config.json` and instead set the `MG_SAIC_PASSWORD` environment variable for the Homebridge process, so the password isn't sitting in plain text on disk. If you do set `password` in config, be aware `config.json` is unencrypted.
 
+On a Docker install (e.g. Homebridge on a NAS), the container's environment can't be changed without recreating it, and `config.json` is often readable by every user of the host. Use `passwordFile` instead: the path of a file that holds only the password, owned by the user Homebridge runs as and readable by it alone. From the Homebridge UI terminal (root in the official image), for example:
+
+```bash
+( umask 077 && read -rs -p 'iSmart password: ' P && printf '%s\n' "$P" > /homebridge/.mg-saic-password ); echo
+```
+
+then set `"passwordFile": "/homebridge/.mg-saic-password"`. The password is read once at startup; only trailing line breaks are stripped. The precedence is `password`, then `passwordFile`, then `MG_SAIC_PASSWORD`. A `passwordFile` that is set but missing, unreadable or empty stops the platform with an error rather than falling back to the environment, and a file readable by other users is flagged in the log. The startup log says which source was used, never the password.
+
 Optional `vin` field pins the plugin to a specific vehicle if the account ever returns more than one; otherwise it uses the first vehicle the account returns.
 
 ## Polling
