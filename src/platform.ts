@@ -20,6 +20,7 @@ export class MgSaicPlatform {
   private enableHeatedSeats: boolean;
   private enableRearDefrost: boolean;
   private enableFrontDefrost: boolean;
+  private enableWindowVentilation: boolean;
   private configuredVin: string | undefined;
 
   private client: SaicClient;
@@ -42,6 +43,7 @@ export class MgSaicPlatform {
       this.enableHeatedSeats        = false;
       this.enableRearDefrost        = false;
       this.enableFrontDefrost       = false;
+      this.enableWindowVentilation  = false;
       this.client = new SaicClient(this.region, { log });
       return;
     }
@@ -57,6 +59,7 @@ export class MgSaicPlatform {
       this.enableHeatedSeats        = false;
       this.enableRearDefrost        = false;
       this.enableFrontDefrost       = false;
+      this.enableWindowVentilation  = false;
       this.client = new SaicClient(this.region, { log });
       return;
     }
@@ -70,9 +73,12 @@ export class MgSaicPlatform {
     // was written (unlike lock/unlock). See TESTING.md before turning them on. There is no
     // equivalent enableWindowControls option: window open/close was tried and confirmed not
     // to work on a real MG4, see README.md and CHANGELOG.md, so it was removed entirely.
+    // enableWindowVentilation below is a different request, the MG S6 EV's all-four-windows
+    // form (controlDoorWindows).
     this.enableHeatedSeats  = (config['enableHeatedSeats']  as boolean | undefined) ?? false;
     this.enableRearDefrost  = (config['enableRearDefrost']  as boolean | undefined) ?? false;
     this.enableFrontDefrost = (config['enableFrontDefrost'] as boolean | undefined) ?? false;
+    this.enableWindowVentilation = (config['enableWindowVentilation'] as boolean | undefined) ?? false;
     this.configuredVin      = config['vin'] as string | undefined;
 
     this.client = new SaicClient(this.region, { log });
@@ -157,6 +163,7 @@ export class MgSaicPlatform {
       enableHeatedSeats:        this.enableHeatedSeats,
       enableRearDefrost:        this.enableRearDefrost,
       enableFrontDefrost:       this.enableFrontDefrost,
+      enableWindowVentilation:  this.enableWindowVentilation,
     });
 
     // The accessory constructor above adds or reuses services according to the current

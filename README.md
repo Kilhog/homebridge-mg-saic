@@ -23,8 +23,9 @@ Exposes one MG EV as one HomeKit accessory with:
 - **Switch** × 2 — heated seats, left and right (off by default, see below)
 - **Switch** — rear window defrost (off by default, see below)
 - **Switch** — front window defrost (off by default, not yet confirmed against real hardware, see below)
+- **Switch** — window ventilation, all four door windows (off by default, MG S6 EV command format, see below)
 
-Deliberately left out: tyre pressures, odometer, trip data, window open/close. Tyre pressure, odometer and trip data have no sensible HomeKit home. Window open/close was tried and does not work, see below.
+Deliberately left out: tyre pressures, odometer, trip data, per-window open/close. Tyre pressure, odometer and trip data have no sensible HomeKit home. Per-window open/close was tried on an MG4 and does not work, see below; the MG S6 EV's all-windows ventilation command is a separate, optional switch.
 
 **Lock/unlock, heated seats, and rear defrost have all been confirmed working against real hardware.** The request format (`POST /vehicle/control` with an `rvcReqType`/`rvcParams` body) is ported from the reference `saic-python-client-ng` client. Unlocking has been confirmed to actually open the doors, seat heat and rear defrost have both been confirmed to physically engage, all on a real MG4 running **software version SWi165 - R11 (Australia)**.
 
@@ -51,6 +52,8 @@ It's also the one control that's easy to overlook: it's governed by `enablePreco
 **Front window defrost is a separate Switch (`enableFrontDefrost`, off by default, not yet confirmed against real hardware)** — added in 0.9.9. Unlike rear defrost it has no dedicated status field on the car: turning it on sends the same climate command as Cabin Heat/Cool but with fan speed 5 instead of 2 (the exact combination confirmed correct by `mg-saic-client`'s own `start_front_defrost`, ported from decrypted iSmart traffic), fixed at 22 °C, and mirrors Active=INACTIVE onto both Cabin Heat and Cabin Cool since all three share the one climate system. Turning it off sends the general stop-climate command. Its On/Off state in HomeKit only reflects what was last commanded, not a value read back from the car, and won't survive a Homebridge restart — reasonable given the car auto-cancels defrost on its own after roughly 10 minutes. If you test it against real hardware, an issue or PR reporting the result is very welcome.
 
 **Window open/close was tried and does not work.** Same request shape as the reference client, byte-verified, but the car consistently rejects it with `code 8`, `"Request failed. Please check the vehicle status and try again."`, whether the car was locked, unlocked with the driver's door held open, or freshly started, all tried against the same MG4 (SWi165 - R11, Australia). There's no config option or switch for it; the low-level `controlWindow`/`WINDOW_ID` request is still in `src/saic-client.js` for reference, unused, in case a firmware update or a different vehicle ever behaves differently. See `CHANGELOG.md`.
+
+**Window ventilation is a separate Switch (`enableWindowVentilation`, off by default)** — the MG S6 EV's own window command, not the MG4-era one above. Ported from the reference client's `control_door_windows`: `rvcReqType "3"` with the sunroof param set to 0 (left alone), all four door windows set to 1, then the action in param 13 (0 close, 1 ventilate, 2 fully open), and no param 255 terminator. **The command format is confirmed on a real MG S6 EV** (Europe, left-hand drive, November 2026): the full-open form was accepted in about 10 seconds and all four window fields then read open. Turning the switch on sends *ventilate* (every door window opens a few centimetres), turning it off sends *close*; those two actions are not yet confirmed on the car, and fully opening the windows is deliberately not exposed. The car reports a ventilated window and a fully open one the same way, so the switch reads On whenever any door window is open, including one opened by hand, and turning it Off closes all four. Per the reference client the S6 doesn't accept single-window control this way. This is not expected to work on an MG4.
 
 Built for a single-vehicle account. If your account has more than one vehicle, set the `vin` config option to pin the plugin to a specific one, see Configuration below.
 
@@ -82,7 +85,8 @@ Via Homebridge Config UI X (the plugin ships a `config.schema.json`, which drive
       "enableTemperatureSensors": true,
       "enableHeatedSeats": false,
       "enableRearDefrost": false,
-      "enableFrontDefrost": false
+      "enableFrontDefrost": false,
+      "enableWindowVentilation": false
     }
   ]
 }

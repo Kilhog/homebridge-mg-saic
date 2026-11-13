@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented here. This project doesn't yet follow strict semantic versioning guarantees while it's pre-1.0, breaking config changes are called out explicitly below when they happen.
 
+## Unreleased
+
+- **Added a Window ventilation switch** (`enableWindowVentilation`, off by default) using the MG S6 EV's window command, ported from `saic-python-client-ng`'s `control_door_windows` / `DoorWindowsAction`: `rvcReqType "3"`, sunroof param 8 = 0, door window params 9–12 = 1, then the action in param 13 (0 close, 1 ventilate, 2 fully open), with **no** param 255 terminator. On sends ventilate, off sends close; fully opening is not exposed. The switch reads On when any of `driverWindow` / `passengerWindow` / `rearLeftWindow` / `rearRightWindow` is non-zero (the car reports ventilated and fully open the same way). **The request format is confirmed on a real MG S6 EV** (Europe, left-hand drive, 13 November 2026): the full-open form was accepted in about 10 s with `failureType` 0, and all four window fields read 1 in the response and on the next status read. Ventilate and close are not yet confirmed. The MG4-era `controlWindow` (open = 3, confirmed not to work on an MG4) is untouched and still unused.
+
 ## 0.9.10
 
 - **Added a lock-triggered rapid refresh sequence to catch a plug-in faster after arriving home.** When the car's lockStatus transitions from unlocked to locked and the charger isn't already known to be plugged in, the plugin now fires a short burst of extra polls — 1, 3, 7, 15 and 25 minutes after the lock, cumulative — instead of waiting for the next scheduled poll (which can be a long way off on a relaxed `pollIntervalMs`) or for the charging-skip streak (see 0.9.8) to run out. Each step forces a real charging check regardless of the skip streak, and the sequence stops as soon as a plug-in is seen. Ported from `mg-saic-ha`'s post-shutdown refresh sequence (lock-engaged trigger); its message-queue-driven event refresh (engine start/stop detection) was not ported — a bigger undertaking with less clear payoff for this plugin's simpler polling model.

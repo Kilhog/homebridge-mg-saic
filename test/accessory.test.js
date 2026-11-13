@@ -102,6 +102,7 @@ function makeAccessory(overrides = {}) {
     startClimate: vi.fn(),
     stopClimate: vi.fn(),
     startFrontDefrost: vi.fn(),
+    controlDoorWindows: vi.fn(),
   };
 
   const api = {
@@ -121,6 +122,7 @@ function makeAccessory(overrides = {}) {
     enableHeatedSeats: true,
     enableRearDefrost: true,
     enableFrontDefrost: true,
+    enableWindowVentilation: true,
     ...overrides,
   });
 
@@ -455,6 +457,58 @@ describe('setHeatActive clears front defrost', () => {
 });
 
 // ---------------------------------------------------------------------------
+// window ventilation (MG S6 EV door windows)
+// ---------------------------------------------------------------------------
+
+describe('readWindowsOpen', () => {
+  it('is false when no data or every door window reads 0', () => {
+    const { acc } = makeAccessory();
+    expect(acc.readWindowsOpen()).toBe(false);
+    acc._lastStatus = { basicVehicleStatus: { driverWindow: 0, passengerWindow: 0, rearLeftWindow: 0, rearRightWindow: 0 } };
+    expect(acc.readWindowsOpen()).toBe(false);
+  });
+
+  it('is true as soon as any one door window reads non-zero', () => {
+    const { acc } = makeAccessory();
+    acc._lastStatus = { basicVehicleStatus: { driverWindow: 0, passengerWindow: 0, rearLeftWindow: 1, rearRightWindow: 0 } };
+    expect(acc.readWindowsOpen()).toBe(true);
+  });
+});
+
+describe('setWindowVentilation', () => {
+  it('sends VENTILATE (1) when turned on, never the full-open action', async () => {
+    const { acc, client } = makeAccessory();
+    client.controlDoorWindows.mockResolvedValue({});
+    await acc.setWindowVentilation(true);
+    expect(client.controlDoorWindows).toHaveBeenCalledWith('TESTVIN123', 1);
+    expect(acc.readWindowsOpen()).toBe(true);
+  });
+
+  it('sends CLOSE (0) when turned off and patches all four windows closed', async () => {
+    const { acc, client } = makeAccessory();
+    acc._lastStatus = { basicVehicleStatus: { lockStatus: 1, driverWindow: 1, passengerWindow: 1, rearLeftWindow: 1, rearRightWindow: 1 } };
+    client.controlDoorWindows.mockResolvedValue({});
+    await acc.setWindowVentilation(false);
+    expect(client.controlDoorWindows).toHaveBeenCalledWith('TESTVIN123', 0);
+    expect(acc._lastStatus.basicVehicleStatus).toEqual({
+      lockStatus: 1, driverWindow: 0, passengerWindow: 0, rearLeftWindow: 0, rearRightWindow: 0,
+    });
+  });
+
+  it('throws a HapStatusError and leaves state unchanged when the command fails', async () => {
+    const { acc, client } = makeAccessory();
+    client.controlDoorWindows.mockRejectedValue(new Error('Request failed.'));
+    await expect(acc.setWindowVentilation(true)).rejects.toThrow('HapStatusError');
+    expect(acc.readWindowsOpen()).toBe(false);
+  });
+
+  it('is listed in the startup services log', () => {
+    const { log } = makeAccessory({ enableWindowVentilation: true });
+    expect(log.info.mock.calls.map(([m]) => m).join('\n')).toMatch(/HomeKit services exposed:.*Window ventilation/);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // setHeatTemperature / setCoolTemperature
 // ---------------------------------------------------------------------------
 
@@ -558,6 +612,7 @@ describe('logExposedServices', () => {
       enableHeatedSeats: false,
       enableRearDefrost: false,
       enableFrontDefrost: false,
+      enableWindowVentilation: false,
     });
     expect(lines(log)).toMatch(/HomeKit services exposed: Battery, Lock, Charging outlet\./);
   });

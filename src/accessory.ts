@@ -72,13 +72,22 @@
  * still works, in case a genuinely cooling car (remoteClimateStatus 3 from some
  * other trigger) needs to be stopped from HomeKit.
  *
- * Window open/close was tried and confirmed NOT to work: the car
+ * Window open/close was tried and confirmed NOT to work on an MG4: the car
  * consistently rejects the command with "Request failed. Please check the
  * vehicle status and try again." regardless of lock state, door-open state,
  * or being freshly started. There's no HomeKit switch for it. The
  * low-level request is still in saic-client.ts (controlWindow/WINDOW_ID)
  * in case a future firmware update or a different vehicle behaves
  * differently, but nothing in this accessory calls it. See CHANGELOG.md.
+ *
+ * Window ventilation (enableWindowVentilation, off by default) is a different request:
+ * the MG S6 EV's all-four-door-windows form of the same rvcReqType "3"
+ * (controlDoorWindows in saic-client.ts). One Switch: On = ventilate (open every door
+ * window a few centimetres), Off = close all four. Fully opening them is deliberately not
+ * exposed. The car reports ventilated and fully open windows the same way, so the
+ * switch reads On whenever any of driverWindow/passengerWindow/rearLeftWindow/
+ * rearRightWindow is non-zero - including a window opened by hand - and turning it Off
+ * then closes all four.
  *
  * Locking the car while it isn't already known to be plugged in triggers a short
  * burst of extra polls (see detectLockEngaged/startLockRefreshSequence), so a
@@ -88,7 +97,7 @@
  */
 
 import type { API, PlatformAccessory, Service, Characteristic, CharacteristicValue } from 'homebridge';
-import { SaicClient, SaicError } from './saic-client.js';
+import { SaicClient, SaicError, DOOR_WINDOWS_ACTION } from './saic-client.js';
 
 // Door field→service-index mapping, used in both setupContactSensors and pushStatusCharacteristics.
 const DOOR_FIELDS: [string, string][] = [
@@ -100,6 +109,9 @@ const DOOR_FIELDS: [string, string][] = [
   ['Bonnet',           'bonnetStatus'],
 ];
 
+// The four door window status fields, the ones the window ventilation switch reads.
+const WINDOW_FIELDS = ['driverWindow', 'passengerWindow', 'rearLeftWindow', 'rearRightWindow'] as const;
+
 export interface AccessoryOpts {
   vin: string;
   log: { info(m: string): void; warn(m: string): void; debug(m: string): void };
@@ -110,6 +122,7 @@ export interface AccessoryOpts {
   enableHeatedSeats: boolean;
   enableRearDefrost: boolean;
   enableFrontDefrost: boolean;
+  enableWindowVentilation: boolean;
 }
 
 // Loosely typed shapes returned by the SAIC API endpoints.
@@ -133,6 +146,7 @@ export class MgSaicAccessory {
   private enableHeatedSeats: boolean;
   private enableRearDefrost: boolean;
   private enableFrontDefrost: boolean;
+  private enableWindowVentilation: boolean;
 
   private batteryService!: Service;
   private lockService!: Service;
@@ -146,6 +160,7 @@ export class MgSaicAccessory {
   private rightSeatHeatService?: Service;
   private rearDefrostService?: Service;
   private frontDefrostService?: Service;
+  private windowVentilationService?: Service;
 
   private _lastStatus:  StatusData   | null = null;
   private _lastCharging: ChargingData | null = null;
@@ -183,7 +198,7 @@ export class MgSaicAccessory {
 
   constructor(accessory: PlatformAccessory, client: SaicClient, {
     vin, log, api, enablePreconditioning, enableDoorSensors, enableTemperatureSensors,
-    enableHeatedSeats, enableRearDefrost, enableFrontDefrost,
+    enableHeatedSeats, enableRearDefrost, enableFrontDefrost, enableWindowVentilation,
   }: AccessoryOpts) {
     this.accessory   = accessory;
     this.client      = client;
@@ -199,6 +214,7 @@ export class MgSaicAccessory {
     this.enableHeatedSeats        = enableHeatedSeats;
     this.enableRearDefrost        = enableRearDefrost;
     this.enableFrontDefrost       = enableFrontDefrost;
+    this.enableWindowVentilation  = enableWindowVentilation;
 
     this.setupInfoService();
     this.setupBatteryService();
@@ -210,6 +226,7 @@ export class MgSaicAccessory {
     if (this.enableHeatedSeats)        this.setupHeatedSeatSwitches();
     if (this.enableRearDefrost)        this.setupRearDefrostSwitch();
     if (this.enableFrontDefrost)       this.setupFrontDefrostSwitch();
+    if (this.enableWindowVentilation)  this.setupWindowVentilationSwitch();
     this.logExposedServices();
   }
 
@@ -232,6 +249,7 @@ export class MgSaicAccessory {
     record(this.enableHeatedSeats,        'Heated seats');
     record(this.enableRearDefrost,        'Rear defrost');
     record(this.enableFrontDefrost,       'Front defrost');
+    record(this.enableWindowVentilation,  'Window ventilation');
 
     this.log.info(`HomeKit services exposed: ${exposed.join(', ')}.`);
     if (disabled.length) {
@@ -411,6 +429,14 @@ export class MgSaicAccessory {
       .onSet((value) => this.setFrontDefrost(value as boolean));
   }
 
+  setupWindowVentilationSwitch(): void {
+    this.windowVentilationService = this.accessory.getService('Window ventilation')
+      ?? this.accessory.addService(this.Service.Switch, 'Window ventilation', 'windowVentilation');
+    this.windowVentilationService.getCharacteristic(this.Characteristic.On)
+      .onGet(() => this.readWindowsOpen())
+      .onSet((value) => this.setWindowVentilation(value as boolean));
+  }
+
   // ------------------------------------------------------------- data reads
 
   private basicStatus(): BasicStatus | undefined {
@@ -504,6 +530,15 @@ export class MgSaicAccessory {
 
   readSeatHeat(field: string): boolean {
     return Boolean(this.basicStatus()?.[field]);
+  }
+
+  /**
+   * true when any door window reads open (non-zero). The car reports a ventilated window and a
+   * fully open one the same way, so this can't tell them apart.
+   */
+  readWindowsOpen(): boolean {
+    const status = this.basicStatus();
+    return WINDOW_FIELDS.some((field) => Boolean(status?.[field]));
   }
 
   // --------------------------------------------------------------- lock write
@@ -728,6 +763,30 @@ export class MgSaicAccessory {
     }
   }
 
+  /**
+   * Handles the "Window ventilation" switch: On sends controlDoorWindows with VENTILATE (all
+   * four door windows open a few centimetres), Off sends CLOSE (all four closed). Same
+   * optimistic pattern as the seat heat switches: on success the four window fields are
+   * patched locally (1 or 0) and the next poll replaces them with what the car reports.
+   */
+  async setWindowVentilation(value: boolean): Promise<void> {
+    this.log.info(`${value ? 'Ventilating (opening a few cm)' : 'Closing'} all door windows via HomeKit...`);
+    try {
+      await this.client.controlDoorWindows(
+        this.vin, value ? DOOR_WINDOWS_ACTION.VENTILATE : DOOR_WINDOWS_ACTION.CLOSE,
+      );
+      const patch = Object.fromEntries(WINDOW_FIELDS.map((field) => [field, value ? 1 : 0]));
+      this._lastStatus = {
+        ...this._lastStatus,
+        basicVehicleStatus: { ...this.basicStatus(), ...patch },
+      };
+      this.log.info('Window ventilation command succeeded.');
+    } catch (err) {
+      this.log.warn(`Window ventilation command failed: ${(err as Error).message}`);
+      throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
+  }
+
   // ---------------------------------------------------------------- polling
 
   /** Called by the platform on its poll interval. Pushes fresh values into HomeKit. */
@@ -878,6 +937,9 @@ export class MgSaicAccessory {
     }
     if (this.enableFrontDefrost && this.frontDefrostService) {
       this.frontDefrostService.updateCharacteristic(this.Characteristic.On, this._frontDefrostActive);
+    }
+    if (this.enableWindowVentilation && this.windowVentilationService) {
+      this.windowVentilationService.updateCharacteristic(this.Characteristic.On, this.readWindowsOpen());
     }
   }
 
