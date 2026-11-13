@@ -3,8 +3,9 @@
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
-  SaicClient, SaicError, SaicTransportError, classifyTransportError, TRANSPORT_RETRY,
+  SaicClient, SaicError, SaicTransportError, SaicCommandOutcomeUnknown, classifyTransportError, TRANSPORT_RETRY,
 } from '../src/saic-client.js';
+import { MgSaicAccessory } from '../src/accessory.js';
 
 // ---------------------------------------------------------------------------
 // helpers: simulated fetch outcomes
@@ -35,8 +36,49 @@ function makeClient(opts = {}) {
   return client;
 }
 
+/** The event-id header of every request fetch was asked to send, in order. */
+const sentEventIds = (fetchMock) => fetchMock.mock.calls.map(([, init]) => init.headers['event-id']);
+
+/**
+ * A real MgSaicAccessory on a stub HomeKit: every Characteristic constant reads as its own
+ * name (LockCurrentState.UNKNOWN === 'UNKNOWN'), every Service type as its name.
+ */
+function makeAccessoryHarness(client, opts = {}) {
+  const characteristics = {};
+  const Characteristic = new Proxy({}, {
+    get: (_, name) => (characteristics[name] ??= new Proxy({ name }, {
+      get: (t, k) => (typeof k === 'symbol' ? undefined : (k in t ? t[k] : k)),
+    })),
+  });
+  const Service = new Proxy({}, { get: (_, name) => name });
+  const services = {};
+  const makeService = () => {
+    const characteristic = {
+      onGet: vi.fn().mockReturnThis(), onSet: vi.fn().mockReturnThis(), setProps: vi.fn().mockReturnThis(),
+    };
+    return { getCharacteristic: () => characteristic, updateCharacteristic: vi.fn(), setCharacteristic: vi.fn().mockReturnThis() };
+  };
+  const platformAccessory = {
+    getService: (name) => services[name] ?? null,
+    addService: (type, name) => (services[name ?? type] = makeService()),
+  };
+  const hap = {
+    Characteristic, Service,
+    HapStatusError: class HapStatusError extends Error { constructor(status) { super('HapStatusError'); this.hapStatus = status; } },
+    HAPStatus: { SERVICE_COMMUNICATION_FAILURE: -70402 },
+  };
+  const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn() };
+  const acc = new MgSaicAccessory(platformAccessory, client, {
+    vin: 'VIN', log, api: { hap }, enablePreconditioning: true, enableDoorSensors: true,
+    enableTemperatureSensors: true, enableHeatedSeats: false, enableRearDefrost: false, enableFrontDefrost: false,
+    ...opts,
+  });
+  return { acc, log, services, Characteristic };
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 // ---------------------------------------------------------------------------
@@ -191,5 +233,139 @@ describe('transport retries', () => {
     vi.stubGlobal('fetch', fetchMock);
     const data = await makeClient().chargingStatus('VIN');
     expect(data).toEqual({ chrgMgmtData: { bmsPackSOCDsp: 500 } });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// event-id loop: tracking phase and the command re-send policy
+// ---------------------------------------------------------------------------
+
+describe('event-id loop and control commands', () => {
+  const pending = (id) => response({ code: 4, message: 'The remote control instruction failed, please try again later.' }, { headers: { 'event-id': id } });
+  const done = response({ code: 0, data: { rvcReqSts: 2, failureType: 0 } });
+
+  it('keeps following the same event id through network errors, never sending the command again', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(pending('E1'))
+      .mockRejectedValueOnce(fetchFailed('ECONNRESET'))
+      .mockRejectedValueOnce(new DOMException('timeout', 'TimeoutError'))
+      .mockResolvedValue(done);
+    vi.stubGlobal('fetch', fetchMock);
+    const client = makeClient();
+    await client.lockVehicle('VIN');
+    expect(sentEventIds(fetchMock)).toEqual(['0', 'E1', 'E1', 'E1']);
+  });
+
+  it('does the same for a status poll', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(pending('S1'))
+      .mockRejectedValueOnce(fetchFailed('UND_ERR_SOCKET'))
+      .mockResolvedValue(response({ code: 0, data: { basicVehicleStatus: {} } }));
+    vi.stubGlobal('fetch', fetchMock);
+    await makeClient().vehicleStatus('VIN');
+    expect(sentEventIds(fetchMock)).toEqual(['0', 'S1', 'S1']);
+  });
+
+  it('re-sends the first POST only when the error proves it never left (connect timeout)', async () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(fetchFailed('UND_ERR_CONNECT_TIMEOUT'))
+      .mockRejectedValueOnce(fetchFailed('ENOTFOUND'))
+      .mockResolvedValue(done);
+    vi.stubGlobal('fetch', fetchMock);
+    const client = makeClient();
+    client.onControlSettled = vi.fn();
+    await client.lockVehicle('VIN');
+    expect(sentEventIds(fetchMock)).toEqual(['0', '0', '0']);
+    expect(client.onControlSettled).toHaveBeenCalledWith('ok');
+  });
+
+  for (const [label, failure] of [
+    ['a reset after sending', () => Promise.reject(fetchFailed('ECONNRESET'))],
+    ['a read timeout', () => Promise.reject(new DOMException('timeout', 'TimeoutError'))],
+    ['an HTTP 502', () => Promise.resolve(response('bad gateway', { status: 502 }))],
+  ]) {
+    it(`gives up with "outcome unknown" and does not re-send after ${label}`, async () => {
+      const fetchMock = vi.fn(failure);
+      vi.stubGlobal('fetch', fetchMock);
+      const client = makeClient();
+      client.onControlSettled = vi.fn();
+      const err = await client.lockVehicle('VIN').catch((e) => e);
+      expect(err).toBeInstanceOf(SaicCommandOutcomeUnknown);
+      expect(err.message).toMatch(/Outcome unknown/);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(client.onControlSettled).toHaveBeenCalledWith('unknown', err);
+    });
+  }
+
+  it('reports a command that never got an answer after being accepted as outcome unknown (408)', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(pending('E9')));
+    const client = makeClient();
+    client._sleep = (ms) => new Promise((r) => setTimeout(r, 5));
+    const err = await client.requestWithEventId('POST', '/vehicle/control', { jsonBody: {} }, { timeoutMs: 30, isCommand: true })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(SaicCommandOutcomeUnknown);
+    expect(err.code).toBe(408);
+    expect(err.message).toMatch(/may still have reached the car/);
+  });
+
+  it('keeps a plain 408 timeout for status polls', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(pending('S9')));
+    const client = makeClient();
+    client._sleep = (ms) => new Promise((r) => setTimeout(r, 5));
+    const err = await client.requestWithEventId('GET', '/vehicle/status', {}, { timeoutMs: 30 }).catch((e) => e);
+    expect(err).not.toBeInstanceOf(SaicCommandOutcomeUnknown);
+    expect(err.code).toBe(408);
+  });
+
+  it('reports a definitive rejection as "failed", not unknown', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response({ code: 8, message: 'Vehicle not locked.' })));
+    const client = makeClient();
+    client.onControlSettled = vi.fn();
+    await expect(client.lockVehicle('VIN')).rejects.not.toBeInstanceOf(SaicCommandOutcomeUnknown);
+    expect(client.onControlSettled).toHaveBeenCalledWith('failed', expect.any(SaicError));
+  });
+});
+
+describe('accessory: unknown command outcome', () => {
+  it('fails the HomeKit write, shows the lock as UNKNOWN, and re-reads the state 30 s later', async () => {
+    vi.useFakeTimers();
+    const client = makeClient();
+    const fetchMock = vi.fn().mockRejectedValue(fetchFailed('ECONNRESET'));
+    vi.stubGlobal('fetch', fetchMock);
+    const { acc, services, Characteristic } = makeAccessoryHarness(client);
+    client.vehicleStatus = vi.fn().mockResolvedValue({ basicVehicleStatus: { lockStatus: 1 } });
+    client.chargingStatus = vi.fn().mockResolvedValue({ chrgMgmtData: {} });
+
+    await expect(acc.setLockTarget(Characteristic.LockTargetState.SECURED)).rejects.toThrow('HapStatusError');
+    expect(fetchMock).toHaveBeenCalledTimes(1); // not re-sent
+    const lock = services.LockMechanism;
+    expect(lock.updateCharacteristic).toHaveBeenLastCalledWith(Characteristic.LockCurrentState, 'UNKNOWN');
+    expect(acc._lastStatus).toBeNull(); // nothing patched optimistically
+
+    expect(client.vehicleStatus).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(client.vehicleStatus).toHaveBeenCalledTimes(1);
+    expect(acc.readLockState()).toBe('SECURED');
+  });
+
+  it('schedules a single re-read for several unknown outcomes in a row', async () => {
+    vi.useFakeTimers();
+    const client = makeClient();
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(fetchFailed('ECONNRESET')));
+    const { acc } = makeAccessoryHarness(client, { enableHeatedSeats: true });
+    client.vehicleStatus = vi.fn().mockResolvedValue({ basicVehicleStatus: {} });
+    client.chargingStatus = vi.fn().mockResolvedValue({ chrgMgmtData: {} });
+    await acc.setSeatHeat('left', true).catch(() => {});
+    await acc.setSeatHeat('right', true).catch(() => {});
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(client.vehicleStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows JAMMED, not UNKNOWN, when the car definitely refused', async () => {
+    const client = makeClient();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response({ code: 8, message: 'Vehicle is powered on.' })));
+    const { acc, services, Characteristic } = makeAccessoryHarness(client);
+    await expect(acc.setLockTarget(Characteristic.LockTargetState.SECURED)).rejects.toThrow('HapStatusError');
+    expect(services.LockMechanism.updateCharacteristic).toHaveBeenLastCalledWith(Characteristic.LockCurrentState, 'JAMMED');
   });
 });

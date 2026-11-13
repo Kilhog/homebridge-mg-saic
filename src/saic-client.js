@@ -105,6 +105,17 @@ export class SaicTransportError extends SaicError {
   }
 }
 
+/**
+ * A control command whose outcome can't be known (connection lost after sending: code 0, or
+ * no answer from the car before the deadline: code 408). Deliberately not re-sent.
+ */
+export class SaicCommandOutcomeUnknown extends SaicError {
+  constructor(message, code) {
+    super(message, code);
+    this.name = 'SaicCommandOutcomeUnknown';
+  }
+}
+
 /** Every error code on an error, its cause, and an AggregateError's inner errors. */
 function errorCodes(err) {
   const codes = new Set();
@@ -157,6 +168,9 @@ export class SaicClient {
     this.token = '';
     this.log = log ?? { info: () => {}, debug: () => {}, warn: () => {} };
     this.requestTimeoutMs = requestTimeoutMs;
+    // Called once every control command has settled ('ok' | 'failed' | 'unknown'); the
+    // accessory re-reads the car's state after an unknown outcome.
+    this.onControlSettled = undefined;
     // Stable device identifier reused across logins so the server always sees the same device.
     this._deviceId = 'simulator*********************************************' + Math.floor(Date.now() / 1000);
     // /vehicle/control commands are serialised through this chain. Firing two at once (e.g.
@@ -329,7 +343,13 @@ export class SaicClient {
   }
 
   /** Retry loop for the asynchronous endpoints. Default timeout is generous for a cold car. */
-  async requestWithEventId(method, path, opts = {}, { timeoutMs = 60000 } = {}) {
+  /**
+   * Retry loop for the asynchronous endpoints. Transient network failures: with an event id,
+   * keep polling the same id until the deadline (never re-send); before that, retry a GET
+   * with backoff; re-send a command (isCommand) only if the error proves it never left,
+   * otherwise throw SaicCommandOutcomeUnknown. See saic-client.ts for more.
+   */
+  async requestWithEventId(method, path, opts = {}, { timeoutMs = 60000, isCommand = false } = {}) {
     const deadline = Date.now() + timeoutMs;
     // Exponential backoff: 3s → 5s → 8s → 12s, capped at 15s. Reduces API
     // hammering on a sleeping car while staying fast for a responsive one.
@@ -343,8 +363,7 @@ export class SaicClient {
     // later." responses collapsing into that one uninformative line at warn level, with the
     // actual message visible only if debug logging happened to be on).
     let lastMessage = '';
-    // Transport failures before any event id was obtained (bounded by TRANSPORT_RETRY). Only a
-    // GET is retried here; a POST is never re-sent.
+    // Transport failures before any event id was obtained (bounded by TRANSPORT_RETRY).
     let initialFailures = 0;
 
     while (Date.now() < deadline) {
@@ -352,11 +371,29 @@ export class SaicClient {
       try {
         return await this.rawRequest(method, path, { ...opts, eventId });
       } catch (err) {
-        if (err instanceof SaicTransportError && eventId === '0' && method === 'GET') {
+        if (err instanceof SaicTransportError) {
+          lastMessage = err.message;
+          if (eventId !== '0') {
+            // Already accepted by the gateway: keep asking about the same event id.
+            const wait = BACKOFF[Math.min(attempt - 1, BACKOFF.length - 1)];
+            this.log.debug(`[${method} ${path}] ${err.message} while waiting on event ${eventId}, `
+              + `asking again in ${wait / 1000}s.`);
+            await this._sleep(wait);
+            continue;
+          }
+          const safeToResend = err.notSent || (!isCommand && method === 'GET');
+          if (!safeToResend) {
+            if (!isCommand) throw err;
+            throw new SaicCommandOutcomeUnknown(
+              `Outcome unknown: ${err.message} after the command was sent, so it may or may not have `
+              + 'reached the car. Not re-sent.', 0,
+            );
+          }
           initialFailures++;
           if (initialFailures >= TRANSPORT_RETRY.attempts) throw err;
           const wait = this._backoffDelay(initialFailures);
-          this.log.debug(`[${method} ${path}] ${err.message}, retrying in ${(wait / 1000).toFixed(1)}s.`);
+          this.log.debug(`[${method} ${path}] ${err.message}${err.notSent ? ' (not sent)' : ''}, `
+            + `retrying in ${(wait / 1000).toFixed(1)}s.`);
           await this._sleep(wait);
           continue;
         }
@@ -368,11 +405,14 @@ export class SaicClient {
         await this._sleep(wait);
       }
     }
-    throw new SaicError(
-      `Timed out after ${timeoutMs / 1000}s waiting for the vehicle`
-      + (lastMessage ? ` (the car's last response was: ${lastMessage})` : ''),
-      408,
-    );
+    const timedOut = `Timed out after ${timeoutMs / 1000}s waiting for the vehicle`
+      + (lastMessage ? ` (the car's last response was: ${lastMessage})` : '');
+    if (isCommand && eventId !== '0') {
+      throw new SaicCommandOutcomeUnknown(
+        `${timedOut}. The gateway had accepted the command, so it may still have reached the car.`, 408,
+      );
+    }
+    throw new SaicError(timedOut, 408);
   }
 
   async login(username, password) {
@@ -453,11 +493,18 @@ export class SaicClient {
    * instead of timing out.
    */
   vehicleControl(vin, { rvcReqType, rvcParams = null }) {
-    return this._enqueueControl(() =>
-      this.requestWithEventId('POST', '/vehicle/control', {
-        jsonBody: { rvcReqType, rvcParams, vin: this._vinHash(vin) },
-      }),
-    );
+    return this._enqueueControl(async () => {
+      try {
+        const result = await this.requestWithEventId('POST', '/vehicle/control', {
+          jsonBody: { rvcReqType, rvcParams, vin: this._vinHash(vin) },
+        }, { isCommand: true });
+        this.onControlSettled?.('ok');
+        return result;
+      } catch (err) {
+        this.onControlSettled?.(err instanceof SaicCommandOutcomeUnknown ? 'unknown' : 'failed', err);
+        throw err;
+      }
+    });
   }
 
   lockVehicle(vin) {

@@ -57,6 +57,10 @@
  * setCoolActive below and TESTING.md. See accessory.ts for the fuller version of
  * this comment.
  *
+ * When a command's outcome is unknown (SaicCommandOutcomeUnknown) it is not re-sent: the
+ * HomeKit write fails, nothing is patched, the lock shows UNKNOWN rather than JAMMED, and the
+ * car's state is re-read RECHECK_DELAY_MS later (scheduleStatusRecheck).
+ *
  * Window open/close was tried and confirmed NOT to work: the car
  * consistently rejects the command with "Request failed. Please check the
  * vehicle status and try again." regardless of lock state, door-open state,
@@ -66,7 +70,7 @@
  * differently, but nothing in this accessory calls it. See CHANGELOG.md.
  */
 
-import { SaicError } from './saic-client.js';
+import { SaicError, SaicCommandOutcomeUnknown } from './saic-client.js';
 
 // Door field→service-index mapping, used in both setupContactSensors and pushStatusCharacteristics.
 const DOOR_FIELDS = [
@@ -84,6 +88,8 @@ export class MgSaicAccessory {
   // starts, mirroring mg-saic-ha's post-shutdown refresh sequence: 1, 3, 7, 15, 25
   // minutes cumulative. Exits early as soon as a plug-in is seen.
   static LOCK_REFRESH_SEQUENCE_MS = [60_000, 120_000, 240_000, 480_000, 600_000];
+  // Delay before the one-off re-read after a command whose outcome is unknown.
+  static RECHECK_DELAY_MS = 30_000;
 
   /**
    * @param {import('homebridge').PlatformAccessory} accessory
@@ -108,6 +114,11 @@ export class MgSaicAccessory {
     this.enableHeatedSeats = enableHeatedSeats;
     this.enableRearDefrost = enableRearDefrost;
     this.enableFrontDefrost = enableFrontDefrost;
+    // A command whose outcome is unknown was not re-sent; find out what the car actually did.
+    this._recheckTimer = undefined;
+    this.client.onControlSettled = (outcome) => {
+      if (outcome === 'unknown') this.scheduleStatusRecheck();
+    };
     // Tracks only what HomeKit last commanded for front defrost, not a value read back
     // from the car - see setFrontDefrost for why.
     this._frontDefrostActive = false;
@@ -463,9 +474,12 @@ export class MgSaicAccessory {
       this.log.info(`${wantLocked ? 'Lock' : 'Unlock'} command succeeded.`);
     } catch (err) {
       this.log.warn(`${wantLocked ? 'Lock' : 'Unlock'} command failed: ${err.message}`);
+      // Unknown outcome: the car may or may not have locked; JAMMED would claim more than we know.
       this.lockService.updateCharacteristic(
         this.Characteristic.LockCurrentState,
-        this.Characteristic.LockCurrentState.JAMMED,
+        err instanceof SaicCommandOutcomeUnknown
+          ? this.Characteristic.LockCurrentState.UNKNOWN
+          : this.Characteristic.LockCurrentState.JAMMED,
       );
       throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
     }
@@ -709,6 +723,19 @@ export class MgSaicAccessory {
       this.startLockRefreshSequence();
     }
     if (lockStatus !== undefined) this._prevLockStatus = lockStatus;
+  }
+
+  /**
+   * Re-reads the car's state RECHECK_DELAY_MS from now, once, after a control command whose
+   * outcome is unknown. A second unknown outcome while one is pending doesn't add another.
+   */
+  scheduleStatusRecheck() {
+    if (this._recheckTimer) return;
+    this.log.info(`The last command's outcome is unknown; re-reading the car's state in ${MgSaicAccessory.RECHECK_DELAY_MS / 1000} s.`);
+    this._recheckTimer = setTimeout(() => {
+      this._recheckTimer = undefined;
+      this.refresh().catch((err) => this.log.debug(`State re-read after an unknown command outcome failed: ${err.message}`));
+    }, MgSaicAccessory.RECHECK_DELAY_MS);
   }
 
   /** Starts the rapid refresh sequence, unless one is already running. */

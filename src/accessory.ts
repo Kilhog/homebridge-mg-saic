@@ -80,6 +80,12 @@
  * in case a future firmware update or a different vehicle behaves
  * differently, but nothing in this accessory calls it. See CHANGELOG.md.
  *
+ * When a command's outcome is unknown - the connection dropped after it was sent, or the
+ * gateway accepted it but the car never answered in time (SaicCommandOutcomeUnknown) - it
+ * is not re-sent. The HomeKit write fails like any other failed command, nothing is patched
+ * optimistically, the lock shows UNKNOWN rather than JAMMED, and the car's actual state is
+ * re-read RECHECK_DELAY_MS later (scheduleStatusRecheck) instead of waiting for the next poll.
+ *
  * Locking the car while it isn't already known to be plugged in triggers a short
  * burst of extra polls (see detectLockEngaged/startLockRefreshSequence), so a
  * plug-in right after arriving home is caught within a few minutes instead of
@@ -88,7 +94,7 @@
  */
 
 import type { API, PlatformAccessory, Service, Characteristic, CharacteristicValue } from 'homebridge';
-import { SaicClient, SaicError } from './saic-client.js';
+import { SaicClient, SaicError, SaicCommandOutcomeUnknown } from './saic-client.js';
 
 // Door field→service-index mapping, used in both setupContactSensors and pushStatusCharacteristics.
 const DOOR_FIELDS: [string, string][] = [
@@ -167,6 +173,9 @@ export class MgSaicAccessory {
   // starts, mirroring mg-saic-ha's post-shutdown refresh sequence: 1, 3, 7, 15, 25
   // minutes cumulative. Exits early as soon as a plug-in is seen.
   private static readonly LOCK_REFRESH_SEQUENCE_MS = [60_000, 120_000, 240_000, 480_000, 600_000];
+  // One-off re-read of the car's state after a command whose outcome is unknown.
+  private _recheckTimer?: NodeJS.Timeout;
+  private static readonly RECHECK_DELAY_MS = 30_000;
   // Stable cache for the last known-good temperature values; named explicitly
   // to avoid hidden-class churn from dynamic property assignment.
   private _lastInteriorTemperature: number | null = null;
@@ -199,6 +208,11 @@ export class MgSaicAccessory {
     this.enableHeatedSeats        = enableHeatedSeats;
     this.enableRearDefrost        = enableRearDefrost;
     this.enableFrontDefrost       = enableFrontDefrost;
+
+    // A command whose outcome is unknown was not re-sent; find out what the car actually did.
+    this.client.onControlSettled = (outcome) => {
+      if (outcome === 'unknown') this.scheduleStatusRecheck();
+    };
 
     this.setupInfoService();
     this.setupBatteryService();
@@ -537,9 +551,12 @@ export class MgSaicAccessory {
       this.log.info(`${wantLocked ? 'Lock' : 'Unlock'} command succeeded.`);
     } catch (err) {
       this.log.warn(`${wantLocked ? 'Lock' : 'Unlock'} command failed: ${(err as Error).message}`);
+      // Unknown outcome: the car may or may not have locked; JAMMED would claim more than we know.
       this.lockService.updateCharacteristic(
         this.Characteristic.LockCurrentState,
-        this.Characteristic.LockCurrentState.JAMMED,
+        err instanceof SaicCommandOutcomeUnknown
+          ? this.Characteristic.LockCurrentState.UNKNOWN
+          : this.Characteristic.LockCurrentState.JAMMED,
       );
       throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
     }
@@ -784,6 +801,20 @@ export class MgSaicAccessory {
       this.startLockRefreshSequence();
     }
     if (lockStatus !== undefined) this._prevLockStatus = lockStatus;
+  }
+
+  /**
+   * Re-reads the car's state RECHECK_DELAY_MS from now, once, after a control command whose
+   * outcome is unknown (it was not re-sent). A second unknown outcome while one is pending
+   * doesn't add another.
+   */
+  scheduleStatusRecheck(): void {
+    if (this._recheckTimer) return;
+    this.log.info(`The last command's outcome is unknown; re-reading the car's state in ${MgSaicAccessory.RECHECK_DELAY_MS / 1000} s.`);
+    this._recheckTimer = setTimeout(() => {
+      this._recheckTimer = undefined;
+      this.refresh().catch((err) => this.log.debug(`State re-read after an unknown command outcome failed: ${(err as Error).message}`));
+    }, MgSaicAccessory.RECHECK_DELAY_MS);
   }
 
   /** Starts the rapid refresh sequence, unless one is already running. */
