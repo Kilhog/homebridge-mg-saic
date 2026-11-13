@@ -546,6 +546,17 @@ export class SaicClient {
     });
   }
 
+  /**
+   * The last status SAIC stored for the car, read WITHOUT waking it (GET /vehicle/status/cache,
+   * plain request, subset of basicVehicleStatus + statusTime). See saic-client.ts.
+   */
+  vehicleStatusCached(vin) {
+    return this._withTransportRetries('status cache', () => this._withSession(() =>
+      this.rawRequest('GET', '/vehicle/status/cache', {
+        params: { vin: this._vinHash(vin), vehStatusReqType: '2' },
+      })));
+  }
+
   chargingStatus(vin) {
     return this.requestWithEventId('GET', '/vehicle/charging/mgmtData', {
       params: { vin: this._vinHash(vin) },

@@ -656,3 +656,104 @@ describe('accessory refresh under outages', () => {
     expect(lines(log.warn).filter((m) => m.includes('Charging status unreachable'))).toHaveLength(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// useStatusCache: routine polls without waking the car
+// ---------------------------------------------------------------------------
+
+describe('status cache (useStatusCache)', () => {
+  // Fields of the reference client's /vehicle/status/cache capture (no doors, no temperatures).
+  const CACHE_BASIC = { lockStatus: 1, bootStatus: 0, bonnetStatus: 0, remoteClimateStatus: 0, rmtHtdRrWndSt: 0, driverWindow: 0 };
+  const FULL_BASIC = {
+    ...CACHE_BASIC, driverDoor: 0, passengerDoor: 0, rearLeftDoor: 0, rearRightDoor: 0,
+    interiorTemperature: 19, exteriorTemperature: 8,
+  };
+
+  /** fetch answering status, cache and charging requests; returns it with a per-path counter. */
+  function vehicleFetch({ cacheBasic = CACHE_BASIC, cacheFails = false } = {}) {
+    const fetchMock = vi.fn(async (url) => {
+      const path = new URL(url).pathname;
+      if (path.endsWith('/vehicle/status/cache')) {
+        if (cacheFails) throw fetchFailed('ECONNRESET');
+        return response({ code: 0, data: { basicVehicleStatus: cacheBasic, statusTime: 1792774872, onlineStatus: 1 } });
+      }
+      if (path.endsWith('/vehicle/status')) return response({ code: 0, data: { basicVehicleStatus: FULL_BASIC } });
+      return response({ code: 0, data: { chrgMgmtData: { ccuOnbdChrgrPlugOn: 1 } } });
+    });
+    fetchMock.count = (suffix) => fetchMock.mock.calls.filter(([url]) => new URL(url).pathname.endsWith(suffix)).length;
+    return fetchMock;
+  }
+
+  const noSensors = { enableDoorSensors: false, enableTemperatureSensors: false, useStatusCache: true };
+
+  it('calls GET /vehicle/status/cache with the hashed VIN, as a plain request (no event id)', async () => {
+    const fetchMock = vehicleFetch();
+    vi.stubGlobal('fetch', fetchMock);
+    const client = makeClient();
+    await client.vehicleStatusCached('VIN123');
+    const [url, init] = fetchMock.mock.calls[0];
+    const parsed = new URL(url);
+    expect(parsed.pathname).toBe('/api.app/v1/vehicle/status/cache');
+    expect(parsed.searchParams.get('vin')).toBe(client._vinHash('VIN123'));
+    expect(parsed.searchParams.get('vehStatusReqType')).toBe('2');
+    expect(init.method).toBe('GET');
+    expect(init.headers['event-id']).toBeUndefined();
+  });
+
+  it('reads the full status first, then the cache on routine polls', async () => {
+    const fetchMock = vehicleFetch();
+    vi.stubGlobal('fetch', fetchMock);
+    const { acc } = makeAccessoryHarness(makeClient(), noSensors);
+    await acc.refresh();
+    await acc.refresh();
+    await acc.refresh();
+    expect(fetchMock.count('/vehicle/status')).toBe(1);
+    expect(fetchMock.count('/vehicle/status/cache')).toBe(2);
+    // fields the cache doesn't carry are kept from the full read
+    expect(acc._lastStatus.basicVehicleStatus.interiorTemperature).toBe(19);
+  });
+
+  it('falls back to the full status when the cache lacks a field an enabled service needs, saying so once', async () => {
+    const fetchMock = vehicleFetch();
+    vi.stubGlobal('fetch', fetchMock);
+    const { acc, log } = makeAccessoryHarness(makeClient(), { useStatusCache: true }); // door + temperature sensors on
+    await acc.refresh();
+    await acc.refresh();
+    await acc.refresh();
+    expect(fetchMock.count('/vehicle/status')).toBe(3);
+    const explained = lines(log.info).filter((m) => m.includes('The status cache lacks'));
+    expect(explained).toHaveLength(1);
+    expect(explained[0]).toMatch(/driverDoor.*interiorTemperature/);
+  });
+
+  it('reads the full status again after a command', async () => {
+    const fetchMock = vehicleFetch();
+    vi.stubGlobal('fetch', fetchMock);
+    const client = makeClient();
+    const { acc } = makeAccessoryHarness(client, noSensors);
+    await acc.refresh();
+    client.onControlSettled('ok');
+    await acc.refresh();
+    expect(fetchMock.count('/vehicle/status')).toBe(2);
+    expect(fetchMock.count('/vehicle/status/cache')).toBe(0);
+  });
+
+  it('falls back to the full status when the cache itself can\'t be read', async () => {
+    const fetchMock = vehicleFetch({ cacheFails: true });
+    vi.stubGlobal('fetch', fetchMock);
+    const { acc } = makeAccessoryHarness(makeClient(), noSensors);
+    await acc.refresh();
+    expect(await acc.refresh()).toBe(true);
+    expect(fetchMock.count('/vehicle/status')).toBe(2);
+  });
+
+  it('never touches the cache when the option is off (the default)', async () => {
+    const fetchMock = vehicleFetch();
+    vi.stubGlobal('fetch', fetchMock);
+    const { acc } = makeAccessoryHarness(makeClient(), { enableDoorSensors: false, enableTemperatureSensors: false });
+    await acc.refresh();
+    await acc.refresh();
+    expect(fetchMock.count('/vehicle/status/cache')).toBe(0);
+    expect(fetchMock.count('/vehicle/status')).toBe(2);
+  });
+});

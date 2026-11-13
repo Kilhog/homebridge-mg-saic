@@ -65,6 +65,11 @@
  * status read is older than staleAfterMs, the contact and temperature sensors show
  * StatusFault. refresh() is single-flight. See accessory.ts for more.
  *
+ * useStatusCache (off by default, not yet tried on a real car): routine polls read SAIC's
+ * stored status (/vehicle/status/cache, doesn't wake the car); the full status is still read
+ * first, after any command, for re-reads and the lock sequence, and whenever the cache lacks
+ * a field an enabled service needs. See accessory.ts for more.
+ *
  * Window open/close was tried and confirmed NOT to work: the car
  * consistently rejects the command with "Request failed. Please check the
  * vehicle status and try again." regardless of lock state, door-open state,
@@ -102,11 +107,12 @@ export class MgSaicAccessory {
   /**
    * @param {import('homebridge').PlatformAccessory} accessory
    * @param {import('./saic-client.js').SaicClient} client
-   * @param {{ vin: string, log: any, api: any, enablePreconditioning: boolean, enableDoorSensors: boolean, enableTemperatureSensors: boolean, enableHeatedSeats: boolean, enableRearDefrost: boolean, enableFrontDefrost: boolean, staleAfterMs?: number }} opts
+   * @param {{ vin: string, log: any, api: any, enablePreconditioning: boolean, enableDoorSensors: boolean, enableTemperatureSensors: boolean, enableHeatedSeats: boolean, enableRearDefrost: boolean, enableFrontDefrost: boolean, staleAfterMs?: number, useStatusCache?: boolean }} opts
    */
   constructor(accessory, client, {
     vin, log, api, enablePreconditioning, enableDoorSensors, enableTemperatureSensors,
     enableHeatedSeats, enableRearDefrost, enableFrontDefrost, staleAfterMs = DEFAULT_STALE_AFTER_MS,
+    useStatusCache = false,
   }) {
     this.accessory = accessory;
     this.client = client;
@@ -132,9 +138,17 @@ export class MgSaicAccessory {
     this._refreshInFlight = undefined;
     // The charging endpoint fails on its own sometimes: log its streaks quietly.
     this.chargingOutage = new OutageLog(log, 'Charging status');
+    // Routine polls read /vehicle/status/cache (doesn't wake the car). Off by default.
+    this.useStatusCache = useStatusCache;
+    // The next status read must be the full /vehicle/status (first poll, after a command).
+    this._fullStatusNext = true;
+    // So the "cache lacks fields" explanation is logged once, not on every poll.
+    this._cacheFallbackLogged = false;
     // A command whose outcome is unknown was not re-sent; find out what the car actually did.
     this._recheckTimer = undefined;
+    // Any command also means the next status read is the full one (useStatusCache).
     this.client.onControlSettled = (outcome) => {
+      this._fullStatusNext = true;
       if (outcome === 'unknown') this.scheduleStatusRecheck();
     };
     // Tracks only what HomeKit last commanded for front defrost, not a value read back
@@ -706,23 +720,64 @@ export class MgSaicAccessory {
    * re-read). Resolves true when /vehicle/status answered, false otherwise (reason in
    * lastStatusError). Single flight: a call while one is running gets that one's result.
    */
-  refresh() {
+  refresh({ full = false } = {}) {
     if (this._refreshInFlight) {
       this.log.debug('A refresh is already running - sharing its result instead of polling again.');
       return this._refreshInFlight;
     }
-    this._refreshInFlight = this.doRefresh().finally(() => {
+    this._refreshInFlight = this.doRefresh(full).finally(() => {
       this._refreshInFlight = undefined;
     });
     return this._refreshInFlight;
   }
 
-  async doRefresh() {
+  /** The basicVehicleStatus fields the enabled services read; a cached status must have them all. */
+  statusFieldsInUse() {
+    const fields = ['lockStatus'];
+    if (this.enablePreconditioning) fields.push('remoteClimateStatus');
+    if (this.enableDoorSensors) fields.push(...DOOR_FIELDS.map(([, field]) => field));
+    if (this.enableTemperatureSensors) fields.push('interiorTemperature', 'exteriorTemperature');
+    if (this.enableHeatedSeats) fields.push('frontLeftSeatHeatLevel', 'frontRightSeatHeatLevel');
+    if (this.enableRearDefrost) fields.push('rmtHtdRrWndSt');
+    return fields;
+  }
+
+  /** Reads the vehicle status: SAIC's cache when useStatusCache allows it, the full one otherwise. */
+  async readStatus(forceFull) {
+    if (!this.useStatusCache || forceFull || this._fullStatusNext || !this._lastStatus) {
+      return { data: await this.client.vehicleStatus(this.vin), full: true };
+    }
+    let cached;
+    try {
+      cached = await this.client.vehicleStatusCached(this.vin);
+    } catch (err) {
+      if (err instanceof SaicError && (err.code === 401 || err.code === 403)) throw err;
+      this.log.debug(`Status cache read failed (${err.message}); reading the full status instead.`);
+      return { data: await this.client.vehicleStatus(this.vin), full: true };
+    }
+    const basic = cached?.basicVehicleStatus;
+    const missing = this.statusFieldsInUse().filter((f) => basic?.[f] === undefined || basic?.[f] === null);
+    if (missing.length) {
+      const why = `The status cache lacks ${missing.join(', ')}, needed by enabled services; reading the full status instead (it wakes the car).`;
+      if (this._cacheFallbackLogged) this.log.debug(why);
+      else this.log.info(why);
+      this._cacheFallbackLogged = true;
+      return { data: await this.client.vehicleStatus(this.vin), full: true };
+    }
+    this.log.debug('Status read from the SAIC cache (car not woken).');
+    // Keep anything the cache doesn't carry from the last full read.
+    return {
+      data: { ...this._lastStatus, ...cached, basicVehicleStatus: { ...this._lastStatus?.basicVehicleStatus, ...basic } },
+      full: false,
+    };
+  }
+
+  async doRefresh(forceFullStatus = false) {
     const lastKnownUnplugged = this._lastCharging?.chrgMgmtData?.ccuOnbdChrgrPlugOn === 0;
     const skipCharging = lastKnownUnplugged && this._chargingSkipStreak < MgSaicAccessory.CHARGING_RECHECK_CYCLES;
 
     const [statusResult, chargingResult] = await Promise.allSettled([
-      this.client.vehicleStatus(this.vin),
+      this.readStatus(forceFullStatus),
       skipCharging ? Promise.resolve(null) : this.client.chargingStatus(this.vin),
     ]);
 
@@ -736,7 +791,8 @@ export class MgSaicAccessory {
     }
 
     if (statusResult.status === 'fulfilled') {
-      this._lastStatus = statusResult.value;
+      this._lastStatus = statusResult.value.data;
+      if (statusResult.value.full) this._fullStatusNext = false;
       this._lastStatusAt = Date.now();
       this.lastStatusError = undefined;
       this.detectLockEngaged();
@@ -806,7 +862,7 @@ export class MgSaicAccessory {
     this.log.info(`The last command's outcome is unknown; re-reading the car's state in ${MgSaicAccessory.RECHECK_DELAY_MS / 1000} s.`);
     this._recheckTimer = setTimeout(() => {
       this._recheckTimer = undefined;
-      this.refresh().catch((err) => this.log.debug(`State re-read after an unknown command outcome failed: ${err.message}`));
+      this.refresh({ full: true }).catch((err) => this.log.debug(`State re-read after an unknown command outcome failed: ${err.message}`));
     }, MgSaicAccessory.RECHECK_DELAY_MS);
   }
 
@@ -834,7 +890,7 @@ export class MgSaicAccessory {
   async runLockRefreshStep(step) {
     this._chargingSkipStreak = MgSaicAccessory.CHARGING_RECHECK_CYCLES;
     try {
-      await this.refresh();
+      await this.refresh({ full: true });
     } catch (err) {
       this.log.debug(`Lock-triggered refresh failed: ${err.message}`);
     }

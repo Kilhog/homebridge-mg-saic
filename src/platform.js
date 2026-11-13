@@ -50,6 +50,13 @@ export class MgSaicPlatform {
     this.enableHeatedSeats = config.enableHeatedSeats ?? false;
     this.enableRearDefrost = config.enableRearDefrost ?? false;
     this.enableFrontDefrost = config.enableFrontDefrost ?? false;
+    // Experimental, off by default: routine polls read SAIC's status cache, which doesn't wake
+    // the car. See useStatusCache in accessory.ts.
+    this.useStatusCache = config.useStatusCache ?? false;
+    if (this.useStatusCache) {
+      this.log.info('useStatusCache is on (experimental): routine polls read the status SAIC has stored '
+        + 'instead of waking the car; the full status is still read after commands and when fields are missing.');
+    }
     this.configuredVin = config.vin;
 
     this.client = new SaicClient(this.region, { log: this.log });
@@ -131,6 +138,7 @@ export class MgSaicPlatform {
       enableRearDefrost: this.enableRearDefrost,
       enableFrontDefrost: this.enableFrontDefrost,
       staleAfterMs: this.pollIntervalMs * STALE_AFTER_POLL_INTERVALS,
+      useStatusCache: this.useStatusCache,
     });
 
     // The accessory constructor above adds or reuses services according to the current

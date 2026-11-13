@@ -92,6 +92,14 @@
  * StatusFault, so stale data doesn't pass for current. refresh() is single-flight: a poll,
  * a lock-triggered refresh and a post-command re-read never run side by side.
  *
+ * useStatusCache (off by default, not yet tried on a real car): routine polls read SAIC's
+ * stored status (/vehicle/status/cache), which doesn't wake the car, instead of
+ * /vehicle/status, which does - every poll, so every 15 min by default, a 12 V battery
+ * concern. The full status is still read for the first poll, after any control command,
+ * for the post-command re-read and the lock-triggered sequence, and whenever the cached
+ * reply lacks a field an enabled service needs (statusFieldsInUse) or the cache can't be
+ * read at all.
+ *
  * Locking the car while it isn't already known to be plugged in triggers a short
  * burst of extra polls (see detectLockEngaged/startLockRefreshSequence), so a
  * plug-in right after arriving home is caught within a few minutes instead of
@@ -126,6 +134,8 @@ export interface AccessoryOpts {
   // How old the last successful status read may get before sensors show StatusFault.
   // Defaults to DEFAULT_STALE_AFTER_MS (3 x the default 15 min poll interval).
   staleAfterMs?: number;
+  // Routine polls read /vehicle/status/cache (doesn't wake the car). Off by default.
+  useStatusCache?: boolean;
 }
 
 /** 3 x the default 15 minute poll interval. */
@@ -198,6 +208,11 @@ export class MgSaicAccessory {
   lastStatusError?: string;
   // The charging endpoint fails on its own sometimes (nothing plugged in): log its streaks quietly.
   private readonly chargingOutage: OutageLog;
+  private readonly useStatusCache: boolean;
+  // The next status read must be the full /vehicle/status (first poll, after a command).
+  private _fullStatusNext = true;
+  // So the "cache lacks fields" explanation is logged once, not on every poll.
+  private _cacheFallbackLogged = false;
   // Stable cache for the last known-good temperature values; named explicitly
   // to avoid hidden-class churn from dynamic property assignment.
   private _lastInteriorTemperature: number | null = null;
@@ -215,6 +230,7 @@ export class MgSaicAccessory {
   constructor(accessory: PlatformAccessory, client: SaicClient, {
     vin, log, api, enablePreconditioning, enableDoorSensors, enableTemperatureSensors,
     enableHeatedSeats, enableRearDefrost, enableFrontDefrost, staleAfterMs = DEFAULT_STALE_AFTER_MS,
+    useStatusCache = false,
   }: AccessoryOpts) {
     this.accessory   = accessory;
     this.client      = client;
@@ -232,9 +248,12 @@ export class MgSaicAccessory {
     this.enableFrontDefrost       = enableFrontDefrost;
     this.staleAfterMs             = staleAfterMs;
     this.chargingOutage           = new OutageLog(log, 'Charging status');
+    this.useStatusCache           = useStatusCache;
 
     // A command whose outcome is unknown was not re-sent; find out what the car actually did.
+    // Any command also means the next status read is the full one (useStatusCache).
     this.client.onControlSettled = (outcome) => {
+      this._fullStatusNext = true;
       if (outcome === 'unknown') this.scheduleStatusRecheck();
     };
 
@@ -791,23 +810,70 @@ export class MgSaicAccessory {
    * false when it didn't (the reason is in lastStatusError; the platform logs it). Single
    * flight: a call while one is running gets that one's result rather than polling again.
    */
-  refresh(): Promise<boolean> {
+  refresh({ full = false }: { full?: boolean } = {}): Promise<boolean> {
     if (this._refreshInFlight) {
       this.log.debug('A refresh is already running - sharing its result instead of polling again.');
       return this._refreshInFlight;
     }
-    this._refreshInFlight = this.doRefresh().finally(() => {
+    this._refreshInFlight = this.doRefresh(full).finally(() => {
       this._refreshInFlight = undefined;
     });
     return this._refreshInFlight;
   }
 
-  private async doRefresh(): Promise<boolean> {
+  /**
+   * The basicVehicleStatus fields the enabled services read. A cached status missing any of
+   * them isn't good enough, and the full status is read instead.
+   */
+  statusFieldsInUse(): string[] {
+    const fields = ['lockStatus'];
+    if (this.enablePreconditioning)    fields.push('remoteClimateStatus');
+    if (this.enableDoorSensors)        fields.push(...DOOR_FIELDS.map(([, field]) => field));
+    if (this.enableTemperatureSensors) fields.push('interiorTemperature', 'exteriorTemperature');
+    if (this.enableHeatedSeats)        fields.push('frontLeftSeatHeatLevel', 'frontRightSeatHeatLevel');
+    if (this.enableRearDefrost)        fields.push('rmtHtdRrWndSt');
+    return fields;
+  }
+
+  /**
+   * Reads the vehicle status: SAIC's cache when useStatusCache allows it (see the header
+   * comment), the full /vehicle/status otherwise. `full` in the result says which one it was.
+   */
+  private async readStatus(forceFull: boolean): Promise<{ data: StatusData; full: boolean }> {
+    if (!this.useStatusCache || forceFull || this._fullStatusNext || !this._lastStatus) {
+      return { data: await this.client.vehicleStatus(this.vin) as StatusData, full: true };
+    }
+    let cached: StatusData | undefined;
+    try {
+      cached = await this.client.vehicleStatusCached(this.vin) as StatusData;
+    } catch (err) {
+      if (err instanceof SaicError && (err.code === 401 || err.code === 403)) throw err;
+      this.log.debug(`Status cache read failed (${(err as Error).message}); reading the full status instead.`);
+      return { data: await this.client.vehicleStatus(this.vin) as StatusData, full: true };
+    }
+    const basic = cached?.['basicVehicleStatus'] as BasicStatus | undefined;
+    const missing = this.statusFieldsInUse().filter((f) => basic?.[f] === undefined || basic?.[f] === null);
+    if (missing.length) {
+      const why = `The status cache lacks ${missing.join(', ')}, needed by enabled services; reading the full status instead (it wakes the car).`;
+      if (this._cacheFallbackLogged) this.log.debug(why);
+      else this.log.info(why);
+      this._cacheFallbackLogged = true;
+      return { data: await this.client.vehicleStatus(this.vin) as StatusData, full: true };
+    }
+    this.log.debug('Status read from the SAIC cache (car not woken).');
+    // Keep anything the cache doesn't carry from the last full read.
+    return {
+      data: { ...this._lastStatus, ...cached, basicVehicleStatus: { ...this.basicStatus(), ...basic } },
+      full: false,
+    };
+  }
+
+  private async doRefresh(forceFullStatus = false): Promise<boolean> {
     const lastKnownUnplugged = this.chrgMgmtData()?.['ccuOnbdChrgrPlugOn'] === 0;
     const skipCharging = lastKnownUnplugged && this._chargingSkipStreak < MgSaicAccessory.CHARGING_RECHECK_CYCLES;
 
     const [statusResult, chargingResult] = await Promise.allSettled([
-      this.client.vehicleStatus(this.vin),
+      this.readStatus(forceFullStatus),
       skipCharging ? Promise.resolve(null) : this.client.chargingStatus(this.vin),
     ]);
 
@@ -821,7 +887,8 @@ export class MgSaicAccessory {
     }
 
     if (statusResult.status === 'fulfilled') {
-      this._lastStatus = statusResult.value as StatusData;
+      this._lastStatus = statusResult.value.data;
+      if (statusResult.value.full) this._fullStatusNext = false;
       this._lastStatusAt = Date.now();
       this.lastStatusError = undefined;
       this.detectLockEngaged();
@@ -892,7 +959,7 @@ export class MgSaicAccessory {
     this.log.info(`The last command's outcome is unknown; re-reading the car's state in ${MgSaicAccessory.RECHECK_DELAY_MS / 1000} s.`);
     this._recheckTimer = setTimeout(() => {
       this._recheckTimer = undefined;
-      this.refresh().catch((err) => this.log.debug(`State re-read after an unknown command outcome failed: ${(err as Error).message}`));
+      this.refresh({ full: true }).catch((err) => this.log.debug(`State re-read after an unknown command outcome failed: ${(err as Error).message}`));
     }, MgSaicAccessory.RECHECK_DELAY_MS);
   }
 
@@ -920,7 +987,7 @@ export class MgSaicAccessory {
   private async runLockRefreshStep(step: number): Promise<void> {
     this._chargingSkipStreak = MgSaicAccessory.CHARGING_RECHECK_CYCLES;
     try {
-      await this.refresh();
+      await this.refresh({ full: true });
     } catch (err) {
       this.log.debug(`Lock-triggered refresh failed: ${(err as Error).message}`);
     }
