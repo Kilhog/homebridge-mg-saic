@@ -121,6 +121,7 @@ function makeAccessory(overrides = {}) {
     enableHeatedSeats: true,
     enableRearDefrost: true,
     enableFrontDefrost: true,
+    enableExperimentalCabinCool: false,
     ...overrides,
   });
 
@@ -406,6 +407,92 @@ describe('setCoolActive', () => {
   });
 });
 
+describe('setCoolActive - experimental (enableExperimentalCabinCool)', () => {
+  it('sends start_ac (no compressor flag) with the Cool tile target temperature', async () => {
+    const { acc, client } = makeAccessory({ enableExperimentalCabinCool: true });
+    client.startClimate.mockResolvedValue({});
+    acc._coolTargetTemp = 18;
+    await acc.setCoolActive(true);
+    // 18 °C → idx = 3 + (18 - 17) = 4; compressor=false, same bytes as Cabin Heat
+    expect(client.startClimate).toHaveBeenCalledWith('TESTVIN123', 4, false);
+    expect(acc.readCoolActive()).toBe(true);
+    expect(acc.readHeatActive()).toBe(false);
+  });
+
+  it('mirrors Active=INACTIVE onto Heat and clears front defrost when turning on', async () => {
+    const { acc, client } = makeAccessory({ enableExperimentalCabinCool: true });
+    client.startFrontDefrost.mockResolvedValue({});
+    await acc.setFrontDefrost(true);
+    client.startClimate.mockResolvedValue({});
+    await acc.setCoolActive(true);
+    expect(acc.heatService.updateCharacteristic).toHaveBeenCalledWith(acc.Characteristic.Active, INACTIVE);
+    expect(acc._frontDefrostActive).toBe(false);
+  });
+
+  it('keeps showing Cool (not Heat) when the car reports remoteClimateStatus 2 after a Cool start', async () => {
+    const { acc, client } = makeAccessory({ enableExperimentalCabinCool: true });
+    client.startClimate.mockResolvedValue({});
+    await acc.setCoolActive(true);
+    client.vehicleStatus.mockResolvedValue({ basicVehicleStatus: { remoteClimateStatus: 2 } });
+    client.chargingStatus.mockResolvedValue({ chrgMgmtData: {} });
+    await acc.refresh();
+    expect(acc.readCoolActive()).toBe(true);
+    expect(acc.readHeatActive()).toBe(false);
+  });
+
+  it('forgets the Cool origin once the car reports the climate off', async () => {
+    const { acc, client } = makeAccessory({ enableExperimentalCabinCool: true });
+    client.startClimate.mockResolvedValue({});
+    await acc.setCoolActive(true);
+    client.chargingStatus.mockResolvedValue({ chrgMgmtData: {} });
+    client.vehicleStatus.mockResolvedValueOnce({ basicVehicleStatus: { remoteClimateStatus: 0 } });
+    await acc.refresh();
+    client.vehicleStatus.mockResolvedValueOnce({ basicVehicleStatus: { remoteClimateStatus: 2 } });
+    await acc.refresh();
+    expect(acc.readHeatActive()).toBe(true);
+    expect(acc.readCoolActive()).toBe(false);
+  });
+
+  it('hands the climate back to Heat when Cabin Heat is turned on afterwards', async () => {
+    const { acc, client } = makeAccessory({ enableExperimentalCabinCool: true });
+    client.startClimate.mockResolvedValue({});
+    await acc.setCoolActive(true);
+    await acc.setHeatActive(true);
+    expect(acc.readHeatActive()).toBe(true);
+    expect(acc.readCoolActive()).toBe(false);
+  });
+
+  it('throws a HapStatusError and leaves state unchanged when the command fails', async () => {
+    const { acc, client } = makeAccessory({ enableExperimentalCabinCool: true });
+    client.startClimate.mockRejectedValue(new Error('timeout'));
+    await expect(acc.setCoolActive(true)).rejects.toThrow('HapStatusError');
+    expect(acc.readCoolActive()).toBe(false);
+  });
+
+  it('logs the raw remoteClimateStatus whenever it changes, and only then', async () => {
+    const { acc, client, log } = makeAccessory({ enableExperimentalCabinCool: true });
+    client.chargingStatus.mockResolvedValue({ chrgMgmtData: {} });
+    client.vehicleStatus.mockResolvedValue({ basicVehicleStatus: { remoteClimateStatus: 3 } });
+    await acc.refresh();
+    await acc.refresh();
+    const logged = log.info.mock.calls.filter(([m]) => m.includes('remoteClimateStatus=3'));
+    expect(logged).toHaveLength(1);
+  });
+
+  it('does not log remoteClimateStatus when the experimental option is off', async () => {
+    const { acc, client, log } = makeAccessory();
+    client.chargingStatus.mockResolvedValue({ chrgMgmtData: {} });
+    client.vehicleStatus.mockResolvedValue({ basicVehicleStatus: { remoteClimateStatus: 3 } });
+    await acc.refresh();
+    expect(log.info).not.toHaveBeenCalledWith(expect.stringContaining('remoteClimateStatus='));
+  });
+
+  it('warns at startup that the experimental mode is on', () => {
+    const { log } = makeAccessory({ enableExperimentalCabinCool: true });
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Experimental Cabin Cool is on'));
+  });
+});
+
 describe('setFrontDefrost', () => {
   it('calls startFrontDefrost and reflects the new state when turning on', async () => {
     const { acc, client } = makeAccessory();
@@ -512,17 +599,27 @@ describe('setCoolTemperature', () => {
     expect(client.startClimate).not.toHaveBeenCalled();
   });
 
-  it('re-sends startClimate with compressor=true when the Cool tile is on', async () => {
+  it('never re-sends the compressor command while Cabin Cool is disabled, even if the car is cooling', async () => {
+    // Real bug this guards against: the slider used to re-send param 22 = 1, the command
+    // confirmed to heat at maximum on a real MG4, whenever remoteClimateStatus read 3.
     const { acc, client } = makeAccessory();
+    acc._lastStatus = { basicVehicleStatus: { remoteClimateStatus: 3 } };
+    await acc.setCoolTemperature(24);
+    expect(client.startClimate).not.toHaveBeenCalled();
+    expect(acc._coolTargetTemp).toBe(24);
+  });
+
+  it('re-sends startClimate WITHOUT the compressor flag when experimental Cool is on and active', async () => {
+    const { acc, client } = makeAccessory({ enableExperimentalCabinCool: true });
     acc._lastStatus = { basicVehicleStatus: { remoteClimateStatus: 3 } };
     client.startClimate.mockResolvedValue({});
     await acc.setCoolTemperature(24);
     // 24 °C → idx = 3 + (24 - 17) = 10
-    expect(client.startClimate).toHaveBeenCalledWith('TESTVIN123', 10, true);
+    expect(client.startClimate).toHaveBeenCalledWith('TESTVIN123', 10, false);
   });
 
   it('throws a HapStatusError when the re-send fails', async () => {
-    const { acc, client } = makeAccessory();
+    const { acc, client } = makeAccessory({ enableExperimentalCabinCool: true });
     acc._lastStatus = { basicVehicleStatus: { remoteClimateStatus: 3 } };
     client.startClimate.mockRejectedValue(new Error('timeout'));
     await expect(acc.setCoolTemperature(24)).rejects.toThrow('HapStatusError');

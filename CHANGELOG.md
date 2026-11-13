@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here. This project doesn't yet follow strict semantic versioning guarantees while it's pre-1.0, breaking config changes are called out explicitly below when they happen.
 
+## Unreleased
+
+- **Added an experimental Cabin Cool mode** (`enableExperimentalCabinCool`, off by default, **not confirmed on any real car**). The reference client's `start_ac` sends fan 2 and a temperature index with **no** param 22 (`ac_on=None`) and leaves heating or cooling to the car; only its front defrost sends 22 = 1. With the option on, Cabin Cool sends exactly that, with its own target temperature — byte for byte the Cabin Heat command. Since the car may report this as `remoteClimateStatus` 2 rather than 3, the plugin remembers locally that Cool started it, so the Cool tile (not Heat) shows as active until the climate stops or another climate command is sent. While the option is on, every change of the raw `remoteClimateStatus` is logged. With the option off, Cabin Cool stays disabled exactly as in 0.9.8. Cabin Heat's command is unchanged.
+- **Fixed: moving the Cabin Cool slider no longer sends the compressor command.** If `remoteClimateStatus` read 3 (cooling started from somewhere else), `setCoolTemperature` re-sent param 22 = 1, the command confirmed in 0.9.8 to heat at maximum on a real MG4. It now only stores the new target, or, with the experimental option on, re-sends without param 22.
+
 ## 0.9.10
 
 - **Added a lock-triggered rapid refresh sequence to catch a plug-in faster after arriving home.** When the car's lockStatus transitions from unlocked to locked and the charger isn't already known to be plugged in, the plugin now fires a short burst of extra polls — 1, 3, 7, 15 and 25 minutes after the lock, cumulative — instead of waiting for the next scheduled poll (which can be a long way off on a relaxed `pollIntervalMs`) or for the charging-skip streak (see 0.9.8) to run out. Each step forces a real charging check regardless of the skip streak, and the sequence stops as soon as a plug-in is seen. Ported from `mg-saic-ha`'s post-shutdown refresh sequence (lock-engaged trigger); its message-queue-driven event refresh (engine start/stop detection) was not ported — a bigger undertaking with less clear payoff for this plugin's simpler polling model.

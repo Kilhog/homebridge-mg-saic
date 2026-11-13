@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { SaicClient, SaicError } from '../src/saic-client.js';
+import { sentControl, VIN } from './control-payload.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -229,5 +230,25 @@ describe('isLoggedIn', () => {
     const client = makeClient();
     client.token = 'some-token';
     expect(client.isLoggedIn).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// climate payloads (rvcReqType "6")
+// ---------------------------------------------------------------------------
+
+describe('climate payloads', () => {
+  // start_ac in saic-python-client-ng: control_climate(fan_speed=2, ac_on=None,
+  // temperature_idx=idx) -> 19 = 2, 20 = idx, NO param 22, then 255. Cabin Heat and the
+  // experimental Cabin Cool both send exactly this.
+  it('startClimate without the compressor flag is byte for byte start_ac', async () => {
+    const body = await sentControl((c) => c.startClimate(VIN, 4, false));
+    expect(body).toEqual({ rvcReqType: '6', params: [[19, [2]], [20, [4]], [255, [0, 0, 0, 0]]] });
+  });
+
+  // stop_ac: control_climate(fan_speed=0, ...) -> 19 = 0, no 20, 22 = 0, then 255.
+  it('stopClimate is byte for byte stop_ac', async () => {
+    const body = await sentControl((c) => c.stopClimate(VIN));
+    expect(body).toEqual({ rvcReqType: '6', params: [[19, [0]], [22, [0]], [255, [0, 0, 0, 0]]] });
   });
 });

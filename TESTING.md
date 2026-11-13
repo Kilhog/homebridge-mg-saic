@@ -206,6 +206,8 @@ What's left isn't resolvable by comparing code: either a firmware/market differe
 
 **This is not the "pre-drive" feature** in the newer iSmart phone apps. That's something else, and it has not been reverse-engineered by this project, the reference client, or the Home Assistant integration. Implementing it would need a fresh traffic capture from a current app.
 
+**Experimental Cabin Cool (`enableExperimentalCabinCool`, off by default, not confirmed on any car).** This sends the reference client's `start_ac` — no param 22, i.e. byte for byte the Cabin Heat command — with the Cool tile's own target temperature, on the theory that the car decides heat vs cool from the target. To test it: pick a warm day (cabin clearly above the target), set the Cool slider well below the cabin temperature (e.g. 18 °C), lock the car, turn Cabin Cool on, and stay near the car. Check three things: whether cold air actually comes out, what the iSmart app shows, and the `Car reports remoteClimateStatus=<n>` lines in the Homebridge log (logged on every change while the option is on; `2` = plain "on" per the MQTT gateway, `3` = cooling per `mg-saic-ha`). If it heats instead, turn it off and leave the option off. Then try the reverse on the Heat tile (target well above the cabin temperature) to confirm Heat still heats.
+
 Still untested: the **stop** path on either tile. Tap Active off and confirm the car actually stops, and that `remoteClimateStatus` returns to `0`.
 
 As with the other control commands, lock the car and turn the ignition off first (see the heated seats/rear defrost note above — the same `code: 8` vehicle-state rejection is likely to apply here too).
@@ -242,6 +244,7 @@ This was observed for roughly 45 minutes straight, across several Homebridge res
 ## Known gaps at this stage
 
 - Pre-conditioning is now two separate HeaterCooler tiles, Cabin Heat and Cabin Cool (17–33 °C slider each), rather than one tile with a mode toggle. Cabin Cool's Active toggle is disabled — confirmed on real hardware to heat at maximum instead of cooling, see section 5. The **stop** path is still unexercised on either tile — see section 5.
+- The experimental Cabin Cool mode (`enableExperimentalCabinCool`, off by default) is a hypothesis from the reference client's `start_ac`, not confirmed on any car — see section 5.
 - Front window defrost (`enableFrontDefrost`, off by default) is new in 0.9.9 and not yet confirmed against real hardware at all — see section 5.
 - The newer iSmart apps' "pre-drive" feature is not implemented and not reverse-engineered anywhere; it would need a fresh traffic capture.
 - Window open/close doesn't work, see section 5 above. Not a config option, not a bug to chase further unless you're on different hardware/firmware.

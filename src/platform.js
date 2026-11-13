@@ -39,6 +39,9 @@ export class MgSaicPlatform {
     this.enableHeatedSeats = config.enableHeatedSeats ?? false;
     this.enableRearDefrost = config.enableRearDefrost ?? false;
     this.enableFrontDefrost = config.enableFrontDefrost ?? false;
+    // Off by default and unconfirmed on any real car: lets the Cabin Cool tile send the
+    // reference client's start_ac (no compressor flag) instead of being refused.
+    this.enableExperimentalCabinCool = config.enableExperimentalCabinCool ?? false;
     this.configuredVin = config.vin;
 
     this.client = new SaicClient(this.region, { log: this.log });
@@ -119,6 +122,7 @@ export class MgSaicPlatform {
       enableHeatedSeats: this.enableHeatedSeats,
       enableRearDefrost: this.enableRearDefrost,
       enableFrontDefrost: this.enableFrontDefrost,
+      enableExperimentalCabinCool: this.enableExperimentalCabinCool,
     });
 
     // The accessory constructor above adds or reuses services according to the current

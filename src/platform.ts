@@ -20,6 +20,7 @@ export class MgSaicPlatform {
   private enableHeatedSeats: boolean;
   private enableRearDefrost: boolean;
   private enableFrontDefrost: boolean;
+  private enableExperimentalCabinCool: boolean;
   private configuredVin: string | undefined;
 
   private client: SaicClient;
@@ -42,6 +43,7 @@ export class MgSaicPlatform {
       this.enableHeatedSeats        = false;
       this.enableRearDefrost        = false;
       this.enableFrontDefrost       = false;
+      this.enableExperimentalCabinCool = false;
       this.client = new SaicClient(this.region, { log });
       return;
     }
@@ -57,6 +59,7 @@ export class MgSaicPlatform {
       this.enableHeatedSeats        = false;
       this.enableRearDefrost        = false;
       this.enableFrontDefrost       = false;
+      this.enableExperimentalCabinCool = false;
       this.client = new SaicClient(this.region, { log });
       return;
     }
@@ -73,6 +76,9 @@ export class MgSaicPlatform {
     this.enableHeatedSeats  = (config['enableHeatedSeats']  as boolean | undefined) ?? false;
     this.enableRearDefrost  = (config['enableRearDefrost']  as boolean | undefined) ?? false;
     this.enableFrontDefrost = (config['enableFrontDefrost'] as boolean | undefined) ?? false;
+    // Off by default and unconfirmed on any real car: lets the Cabin Cool tile send the
+    // reference client's start_ac (no compressor flag) instead of being refused.
+    this.enableExperimentalCabinCool = (config['enableExperimentalCabinCool'] as boolean | undefined) ?? false;
     this.configuredVin      = config['vin'] as string | undefined;
 
     this.client = new SaicClient(this.region, { log });
@@ -157,6 +163,7 @@ export class MgSaicPlatform {
       enableHeatedSeats:        this.enableHeatedSeats,
       enableRearDefrost:        this.enableRearDefrost,
       enableFrontDefrost:       this.enableFrontDefrost,
+      enableExperimentalCabinCool: this.enableExperimentalCabinCool,
     });
 
     // The accessory constructor above adds or reuses services according to the current

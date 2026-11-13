@@ -63,14 +63,27 @@
  * each side independently addressable from Siri and HomeKit Automations, e.g.
  * "turn on Cabin Heat" or a 7am/2pm scheduled switch.
  *
- * Cabin Cool's Active toggle is disabled (setCoolActive rejects turning it on):
- * a real MG4 test confirmed sending the compressor flag (see docs/API.md) does
+ * Cabin Cool's Active toggle is disabled by default (setCoolActive rejects turning it
+ * on): a real MG4 test confirmed sending the compressor flag (see docs/API.md) does
  * not cool the car, it runs the PTC heater at maximum instead - both
  * remoteClimateStatus and the iSmart app agreed. See TESTING.md for the
  * comparison against townsmcp/mg-saic-ha's MG4 profile, which rules out fan
  * speed as the cause but doesn't explain the reversal either. Turning Cool off
  * still works, in case a genuinely cooling car (remoteClimateStatus 3 from some
- * other trigger) needs to be stopped from HomeKit.
+ * other trigger) needs to be stopped from HomeKit. The compressor flag is never
+ * sent from the Cool tile any more, not even when its slider moves.
+ *
+ * enableExperimentalCabinCool (off by default, NOT confirmed on any real car) turns
+ * the Cool tile back on with a different hypothesis: the reference client's own
+ * start_ac never sends the compressor flag at all (ac_on=None) - it only sends fan 2
+ * and a target temperature index and leaves heating or cooling to the car - and
+ * keeps param 22 = 1 for front defrost only. So in that mode the Cool tile sends
+ * exactly the Cabin Heat command, just with the Cool tile's own target temperature.
+ * Since the car may then report remoteClimateStatus 2 ("on", per
+ * saic-python-mqtt-gateway's decode) rather than 3, _coolStartedLocally remembers
+ * that it was the Cool tile that asked, so the right tile shows as active; the raw
+ * remoteClimateStatus is logged on every change while the option is on, to find
+ * out how a given car actually reports it.
  *
  * Window open/close was tried and confirmed NOT to work: the car
  * consistently rejects the command with "Request failed. Please check the
@@ -110,6 +123,7 @@ export interface AccessoryOpts {
   enableHeatedSeats: boolean;
   enableRearDefrost: boolean;
   enableFrontDefrost: boolean;
+  enableExperimentalCabinCool?: boolean;
 }
 
 // Loosely typed shapes returned by the SAIC API endpoints.
@@ -133,6 +147,7 @@ export class MgSaicAccessory {
   private enableHeatedSeats: boolean;
   private enableRearDefrost: boolean;
   private enableFrontDefrost: boolean;
+  private enableExperimentalCabinCool: boolean;
 
   private batteryService!: Service;
   private lockService!: Service;
@@ -180,10 +195,18 @@ export class MgSaicAccessory {
   // Tracks only what HomeKit last commanded for front defrost, not a value read back from
   // the car - see setFrontDefrost for why.
   private _frontDefrostActive = false;
+  // True after the experimental Cool tile started the climate (see setCoolActive). Its
+  // command is the same start_ac as Cabin Heat, so the car may report it as
+  // remoteClimateStatus 2 like heat; this remembers which tile asked. Local only, like
+  // _frontDefrostActive: cleared by any other climate command, by remoteClimateStatus
+  // reading anything other than 2 or 3, and by a Homebridge restart.
+  private _coolStartedLocally = false;
+  // Last remoteClimateStatus seen, so it's only logged when it changes.
+  private _lastRemoteClimateStatus?: number;
 
   constructor(accessory: PlatformAccessory, client: SaicClient, {
     vin, log, api, enablePreconditioning, enableDoorSensors, enableTemperatureSensors,
-    enableHeatedSeats, enableRearDefrost, enableFrontDefrost,
+    enableHeatedSeats, enableRearDefrost, enableFrontDefrost, enableExperimentalCabinCool = false,
   }: AccessoryOpts) {
     this.accessory   = accessory;
     this.client      = client;
@@ -199,6 +222,7 @@ export class MgSaicAccessory {
     this.enableHeatedSeats        = enableHeatedSeats;
     this.enableRearDefrost        = enableRearDefrost;
     this.enableFrontDefrost       = enableFrontDefrost;
+    this.enableExperimentalCabinCool = enableExperimentalCabinCool;
 
     this.setupInfoService();
     this.setupBatteryService();
@@ -236,6 +260,13 @@ export class MgSaicAccessory {
     this.log.info(`HomeKit services exposed: ${exposed.join(', ')}.`);
     if (disabled.length) {
       this.log.info(`Not exposed, disabled in config: ${disabled.join(', ')}.`);
+    }
+    if (this.enablePreconditioning && this.enableExperimentalCabinCool) {
+      this.log.warn(
+        'Experimental Cabin Cool is on (enableExperimentalCabinCool): the Cool tile sends the same '
+        + 'start command as Cabin Heat (no compressor flag) with its own target temperature, and leaves '
+        + 'heating or cooling to the car. Not confirmed on any real car - see README.md.',
+      );
     }
   }
 
@@ -321,8 +352,8 @@ export class MgSaicAccessory {
       .onGet(() => this._heatTargetTemp)
       .onSet((value) => this.setHeatTemperature(value as number));
 
-    // "Cabin Cool" — locked to TargetHeaterCoolerState.COOL. Turning Active on
-    // is disabled; see setCoolActive and TESTING.md for why.
+    // "Cabin Cool" — locked to TargetHeaterCoolerState.COOL. Turning Active on is
+    // disabled unless enableExperimentalCabinCool is set; see setCoolActive.
     this.coolService = this.accessory.getService('Cabin Cool')
       ?? this.accessory.addService(this.Service.HeaterCooler, 'Cabin Cool', 'preconditionCool');
 
@@ -449,14 +480,21 @@ export class MgSaicAccessory {
       : this.Characteristic.LockCurrentState.UNSECURED;
   }
 
-  /** remoteClimateStatus === 2: the car is running the PTC resistive heater. */
+  /**
+   * remoteClimateStatus === 2: the car is running the PTC resistive heater - unless the
+   * experimental Cool tile was what started it (see _coolStartedLocally).
+   */
   readHeatActive(): boolean {
-    return this.basicStatus()?.['remoteClimateStatus'] === 2;
+    return this.basicStatus()?.['remoteClimateStatus'] === 2 && !this._coolStartedLocally;
   }
 
-  /** remoteClimateStatus === 3: the car is running the AC compressor. */
+  /**
+   * remoteClimateStatus === 3: the car is running the AC compressor. Also true on 2 when the
+   * experimental Cool tile started the climate, since its command is the same start_ac as heat.
+   */
   readCoolActive(): boolean {
-    return this.basicStatus()?.['remoteClimateStatus'] === 3;
+    const status = this.basicStatus()?.['remoteClimateStatus'];
+    return status === 3 || (status === 2 && this._coolStartedLocally);
   }
 
   /** Returns the interior temperature for the HeaterCooler CurrentTemperature
@@ -592,6 +630,7 @@ export class MgSaicAccessory {
       } else {
         await this.client.stopClimate(this.vin);
       }
+      this._coolStartedLocally = false;
       this._lastStatus = {
         ...this._lastStatus,
         basicVehicleStatus: { ...this.basicStatus(), remoteClimateStatus: value ? 2 : 0 },
@@ -609,28 +648,49 @@ export class MgSaicAccessory {
   }
 
   /**
-   * Handles a HomeKit Active toggle on the "Cabin Cool" tile. Turning it ON is
-   * refused: sending the AC compressor flag was confirmed on a real MG4 to run
+   * Handles a HomeKit Active toggle on the "Cabin Cool" tile. By default turning it
+   * ON is refused: sending the AC compressor flag was confirmed on a real MG4 to run
    * the cabin heater at maximum instead of cooling it (see TESTING.md), so this
-   * plugin no longer sends that command until the correct one is known. Turning
-   * it OFF still works, in case remoteClimateStatus reads 3 from some other
-   * trigger and needs stopping from HomeKit.
+   * plugin no longer sends that command. Turning it OFF always works, in case
+   * remoteClimateStatus reads 3 from some other trigger and needs stopping from HomeKit.
+   *
+   * With enableExperimentalCabinCool, turning it ON sends the reference client's
+   * start_ac instead - fan 2 and the Cool tile's target temperature index, no param 22,
+   * i.e. byte for byte the Cabin Heat command - and relies on the car to cool towards
+   * a target below the cabin temperature. Unconfirmed on any real car. On success it
+   * mirrors Active=INACTIVE onto Cabin Heat and Front Defrost, like Heat does.
    */
   async setCoolActive(value: boolean): Promise<void> {
-    if (value) {
+    if (value && !this.enableExperimentalCabinCool) {
       this.log.warn(
         'Cabin Cool is disabled: the compressor command is confirmed to heat the cabin at maximum '
-        + 'instead of cooling it on real hardware. See TESTING.md.',
+        + 'instead of cooling it on real hardware. See TESTING.md. enableExperimentalCabinCool '
+        + 'tries an unconfirmed alternative, see README.md.',
       );
       throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
     }
-    this.log.info('Stopping cabin cool pre-conditioning via HomeKit...');
+    this.log.info(value
+      ? `Starting cabin cool pre-conditioning via HomeKit (experimental, target ${this._coolTargetTemp} °C)...`
+      : 'Stopping cabin cool pre-conditioning via HomeKit...');
     try {
-      await this.client.stopClimate(this.vin);
+      if (value) {
+        const idx = 3 + Math.round(this._coolTargetTemp - 17);
+        await this.client.startClimate(this.vin, idx, false);
+      } else {
+        await this.client.stopClimate(this.vin);
+      }
+      this._coolStartedLocally = value;
+      // 2 rather than 3 on start: start_ac is the command the MQTT gateway decodes as
+      // remoteClimateStatus 2 ("on"); _coolStartedLocally makes it read as Cool.
       this._lastStatus = {
         ...this._lastStatus,
-        basicVehicleStatus: { ...this.basicStatus(), remoteClimateStatus: 0 },
+        basicVehicleStatus: { ...this.basicStatus(), remoteClimateStatus: value ? 2 : 0 },
       };
+      if (value) {
+        this.heatService?.updateCharacteristic(this.Characteristic.Active, this.Characteristic.Active.INACTIVE);
+        this._frontDefrostActive = false;
+        this.frontDefrostService?.updateCharacteristic(this.Characteristic.On, false);
+      }
       this.log.info('Cabin cool command succeeded.');
     } catch (err) {
       this.log.warn(`Cabin cool command failed: ${(err as Error).message}`);
@@ -659,16 +719,23 @@ export class MgSaicAccessory {
   }
 
   /**
-   * Handles a CoolingThresholdTemperature change on the "Cabin Cool" tile.
-   * Mirror of setHeatTemperature with the compressor on.
+   * Handles a CoolingThresholdTemperature change on the "Cabin Cool" tile. Always stores
+   * the new target. While the Cool tile is active it re-sends the start command with the
+   * new index, but only with enableExperimentalCabinCool - and then without the
+   * compressor flag, same as setCoolActive. It used to re-send with the compressor flag,
+   * the very command confirmed to heat at maximum on a real MG4.
    */
   async setCoolTemperature(temp: number): Promise<void> {
     this._coolTargetTemp = temp;
     if (this.readCoolActive()) {
-      this.log.info(`Adjusting cabin cool target to ${temp} °C...`);
+      if (!this.enableExperimentalCabinCool) {
+        this.log.info(`Cabin Cool target set to ${temp} °C (not sent: Cabin Cool is disabled, see TESTING.md).`);
+        return;
+      }
+      this.log.info(`Adjusting cabin cool target to ${temp} °C (experimental)...`);
       try {
         const idx = 3 + Math.round(temp - 17);
-        await this.client.startClimate(this.vin, idx, true);
+        await this.client.startClimate(this.vin, idx, false);
         this.log.info(`Cabin cool target updated to ${temp} °C.`);
       } catch (err) {
         this.log.warn(`Cabin cool temperature update failed: ${(err as Error).message}`);
@@ -713,6 +780,7 @@ export class MgSaicAccessory {
         await this.client.stopClimate(this.vin);
       }
       this._frontDefrostActive = value;
+      this._coolStartedLocally = false;
       if (value) {
         this._lastStatus = {
           ...this._lastStatus,
@@ -752,6 +820,7 @@ export class MgSaicAccessory {
     if (statusResult.status === 'fulfilled') {
       this._lastStatus = statusResult.value as StatusData;
       this.detectLockEngaged();
+      this.trackClimateStatus();
       this.pushStatusCharacteristics();
     } else {
       this.log.warn(`Status refresh failed: ${(statusResult.reason as Error).message}`);
@@ -784,6 +853,21 @@ export class MgSaicAccessory {
       this.startLockRefreshSequence();
     }
     if (lockStatus !== undefined) this._prevLockStatus = lockStatus;
+  }
+
+  /**
+   * Clears _coolStartedLocally once the car reports the climate as anything other than
+   * running (2 or 3), and, while enableExperimentalCabinCool is on, logs every change of the
+   * raw remoteClimateStatus - the one signal that tells whether that mode heats or cools.
+   */
+  private trackClimateStatus(): void {
+    const status = this.basicStatus()?.['remoteClimateStatus'] as number | undefined;
+    if (status !== 2 && status !== 3) this._coolStartedLocally = false;
+    if (this.enableExperimentalCabinCool && status !== this._lastRemoteClimateStatus) {
+      this.log.info(`Car reports remoteClimateStatus=${status ?? 'absent'}`
+        + (this._coolStartedLocally ? ' (climate last started by the experimental Cabin Cool tile).' : '.'));
+    }
+    this._lastRemoteClimateStatus = status;
   }
 
   /** Starts the rapid refresh sequence, unless one is already running. */
