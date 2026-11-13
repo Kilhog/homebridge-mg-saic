@@ -159,15 +159,54 @@ export function climateTemperatureIndex(celsius) {
   return Math.round(celsius) - 14;
 }
 
-// Door field→service-index mapping, used in both setupContactSensors and pushStatusCharacteristics.
+// Door status fields, one contact sensor each; the field is also the service subtype.
+// Used in setupContactSensors, statusFieldsInUse and pushStatusCharacteristics.
 const DOOR_FIELDS = [
-  ['Driver door', 'driverDoor'],
-  ['Passenger door', 'passengerDoor'],
-  ['Rear left door', 'rearLeftDoor'],
-  ['Rear right door', 'rearRightDoor'],
-  ['Boot', 'bootStatus'],
-  ['Bonnet', 'bonnetStatus'],
+  'driverDoor', 'passengerDoor', 'rearLeftDoor', 'rearRightDoor', 'bootStatus', 'bonnetStatus',
 ];
+
+// ------------------------------------------------------------- service names
+
+/**
+ * The name each tile gets in the Home app, per `language` (config, default English).
+ * Keyed by the service subtype, which never changes: it's how a cached service is found
+ * again (getServiceById), so renaming a tile here keeps its room, scenes and automations.
+ * Battery, lock and charging outlet have no subtype (one of each), hence their own keys.
+ *
+ * Each name goes into both Name and ConfiguredName. Since iOS 16 the Home app reads
+ * ConfiguredName for the controls of a multi-service accessory and, when it's missing,
+ * shows the bare type instead ("Switch 2", "Heater-Cooler", "Outlet"); sensors still fall
+ * back to Name. See nameService for how a name chosen in the Home app is kept.
+ */
+export const SERVICE_NAMES = {
+  battery: { en: 'Battery', fr: 'Batterie' },
+  lock: { en: 'Lock', fr: 'Verrouillage' },
+  chargingOutlet: { en: 'Charging cable', fr: 'Câble de charge' },
+  preconditionHeat: { en: 'Cabin Heat', fr: 'Chauffage habitacle' },
+  preconditionCool: { en: 'Cabin Cool', fr: 'Climatisation habitacle' },
+  driverDoor: { en: 'Driver door', fr: 'Porte conducteur' },
+  passengerDoor: { en: 'Passenger door', fr: 'Porte passager' },
+  rearLeftDoor: { en: 'Rear left door', fr: 'Porte arrière gauche' },
+  rearRightDoor: { en: 'Rear right door', fr: 'Porte arrière droite' },
+  bootStatus: { en: 'Boot', fr: 'Coffre' },
+  bonnetStatus: { en: 'Bonnet', fr: 'Capot' },
+  interiorTemperature: { en: 'Interior temperature', fr: 'Température intérieure' },
+  exteriorTemperature: { en: 'Exterior temperature', fr: 'Température extérieure' },
+  leftSeatHeat: { en: 'Left seat heat', fr: 'Siège avant gauche' },
+  rightSeatHeat: { en: 'Right seat heat', fr: 'Siège avant droit' },
+  rearDefrost: { en: 'Rear window defrost', fr: 'Dégivrage arrière' },
+  frontDefrost: { en: 'Front window defrost', fr: 'Dégivrage avant' },
+  steeringWheelHeat: { en: 'Heated steering wheel', fr: 'Volant chauffant' },
+  windowVentilation: { en: 'Window ventilation', fr: 'Aération fenêtres' },
+  rearLeftSeatHeat: { en: 'Rear left seat heat', fr: 'Siège arrière gauche' },
+  rearRightSeatHeat: { en: 'Rear right seat heat', fr: 'Siège arrière droit' },
+  powerTailgate: { en: 'Tailgate', fr: 'Hayon' },
+};
+
+/** `language` from config: "fr" or "en"; anything else (including unset) is English. */
+export function serviceLanguage(value) {
+  return value === 'fr' ? 'fr' : 'en';
+}
 
 // The four door window status fields, the ones the window ventilation switch reads.
 const WINDOW_FIELDS = ['driverWindow', 'passengerWindow', 'rearLeftWindow', 'rearRightWindow'];
@@ -184,7 +223,7 @@ export class MgSaicAccessory {
   /**
    * @param {import('homebridge').PlatformAccessory} accessory
    * @param {import('./saic-client.js').SaicClient} client
-   * @param {{ vin: string, log: any, api: any, enablePreconditioning: boolean, enableDoorSensors: boolean, enableTemperatureSensors: boolean, enableHeatedSeats: boolean, enableRearDefrost: boolean, enableFrontDefrost: boolean, enableHeatedSteeringWheel: boolean, enableWindowVentilation: boolean, enableRearHeatedSeats: boolean, frontSeatHeatLevel?: number, enablePowerTailgate: boolean, staleAfterMs?: number, useStatusCache?: boolean, enableExperimentalCabinCool?: boolean, climateRange?: { min: number, max: number } }} opts
+   * @param {{ vin: string, log: any, api: any, enablePreconditioning: boolean, enableDoorSensors: boolean, enableTemperatureSensors: boolean, enableHeatedSeats: boolean, enableRearDefrost: boolean, enableFrontDefrost: boolean, enableHeatedSteeringWheel: boolean, enableWindowVentilation: boolean, enableRearHeatedSeats: boolean, frontSeatHeatLevel?: number, enablePowerTailgate: boolean, staleAfterMs?: number, useStatusCache?: boolean, language?: 'en' | 'fr', enableExperimentalCabinCool?: boolean, climateRange?: { min: number, max: number } }} opts
    */
   constructor(accessory, client, {
     vin, model, log, api, enablePreconditioning, enableDoorSensors, enableTemperatureSensors,
@@ -197,6 +236,7 @@ export class MgSaicAccessory {
     climateRange = climateTemperatureRange(),
     staleAfterMs = DEFAULT_STALE_AFTER_MS,
     useStatusCache = false,
+    language = 'en',
   }) {
     this.accessory = accessory;
     this.client = client;
@@ -234,6 +274,9 @@ export class MgSaicAccessory {
     this.chargingOutage = new OutageLog(log, 'Charging status');
     // Routine polls read /vehicle/status/cache (doesn't wake the car). Off by default.
     this.useStatusCache = useStatusCache;
+    this.language = serviceLanguage(language);
+    // Every service this run set up, so removeUnusedServices can drop the cached ones it didn't.
+    this._servicesInUse = new Set();
     // The next status read must be the full /vehicle/status (first poll, after a command).
     this._fullStatusNext = true;
     // So the "cache lacks fields" explanation is logged once, not on every poll.
@@ -273,6 +316,7 @@ export class MgSaicAccessory {
     if (this.enableWindowVentilation) this.setupWindowVentilationSwitch();
     if (this.enableRearHeatedSeats) this.setupRearSeatHeatSwitches();
     if (this.enablePowerTailgate) this.setupTailgateOpener();
+    this.removeUnusedServices();
 
     // Cached latest reads, so a slow poll of one endpoint doesn't block
     // characteristic reads for data from the other endpoint.
@@ -317,7 +361,8 @@ export class MgSaicAccessory {
     const record = (on, label) => {
       (on ? exposed : disabled).push(label);
     };
-    record(this.enablePreconditioning, 'Pre-conditioning (Cabin Heat / Cabin Cool)');
+    record(this.enablePreconditioning,
+      `Pre-conditioning (${this.enableExperimentalCabinCool ? 'Cabin Heat / Cabin Cool' : 'Cabin Heat'})`);
     record(this.enableDoorSensors, 'Door sensors');
     record(this.enableTemperatureSensors, 'Temperature sensors');
     record(this.enableHeatedSeats, 'Heated seats');
@@ -341,6 +386,52 @@ export class MgSaicAccessory {
     }
   }
 
+  /**
+   * The service of this type and subtype (or, with no subtype, the only one of this type),
+   * from the cache or newly added, named per SERVICE_NAMES[key]. Found by subtype rather
+   * than by name, since the name changes with `language` and the subtype doesn't.
+   */
+  useService(type, key, subtype) {
+    const name = SERVICE_NAMES[key][this.language];
+    const service = (subtype
+      ? this.accessory.getServiceById(type, subtype)
+      : this.accessory.getService(type))
+      ?? this.accessory.addService(type, name, subtype);
+    this.nameService(service, name);
+    this._servicesInUse.add(service);
+    return service;
+  }
+
+  /**
+   * Sets Name and ConfiguredName. ConfiguredName is also what the Home app writes when a
+   * tile is renamed there, so it's only overwritten while it's empty or still holds the
+   * name this plugin gave last time (the previous Name): a name chosen in the Home app
+   * survives restarts, and switching `language` still renames the tiles nobody touched.
+   */
+  nameService(service, name) {
+    const { Name, ConfiguredName } = this.Characteristic;
+    const previousName = service.testCharacteristic(Name) ? service.getCharacteristic(Name).value : undefined;
+    service.displayName = name;
+    service.setCharacteristic(Name, name);
+    if (!service.testCharacteristic(ConfiguredName)) service.addOptionalCharacteristic(ConfiguredName);
+    const configured = service.getCharacteristic(ConfiguredName).value;
+    if (!configured || configured === previousName) service.setCharacteristic(ConfiguredName, name);
+  }
+
+  /**
+   * Drops the cached services this run didn't set up: an option turned off in config, or
+   * Cabin Cool while enableExperimentalCabinCool is off. Without this their tiles stayed in
+   * the Home app with no handlers behind them. Only services with one of this plugin's
+   * subtypes are touched, never AccessoryInformation.
+   */
+  removeUnusedServices() {
+    for (const service of [...this.accessory.services]) {
+      if (!service.subtype || !(service.subtype in SERVICE_NAMES) || this._servicesInUse.has(service)) continue;
+      this.log.info(`Removing the "${service.displayName}" tile from HomeKit: it's turned off in config.`);
+      this.accessory.removeService(service);
+    }
+  }
+
   /** frontSeatHeatLevel must be 1, 2 or 3; anything else falls back to 3 with a warning. */
   validFrontSeatHeatLevel(level) {
     if (level === undefined || level === null) return 3;
@@ -359,8 +450,7 @@ export class MgSaicAccessory {
   }
 
   setupBatteryService() {
-    this.batteryService = this.accessory.getService(this.Service.Battery)
-      ?? this.accessory.addService(this.Service.Battery);
+    this.batteryService = this.useService(this.Service.Battery, 'battery');
 
     this.batteryService.getCharacteristic(this.Characteristic.BatteryLevel)
       .onGet(() => this.readSoc());
@@ -375,8 +465,7 @@ export class MgSaicAccessory {
   }
 
   setupLockService() {
-    this.lockService = this.accessory.getService(this.Service.LockMechanism)
-      ?? this.accessory.addService(this.Service.LockMechanism);
+    this.lockService = this.useService(this.Service.LockMechanism, 'lock');
 
     this.lockService.getCharacteristic(this.Characteristic.LockCurrentState)
       .onGet(() => this.readLockState());
@@ -389,8 +478,7 @@ export class MgSaicAccessory {
   }
 
   setupOutletService() {
-    this.outletService = this.accessory.getService(this.Service.Outlet)
-      ?? this.accessory.addService(this.Service.Outlet);
+    this.outletService = this.useService(this.Service.Outlet, 'chargingOutlet');
 
     this.outletService.getCharacteristic(this.Characteristic.On)
       .onGet(() => this.readPluggedIn());
@@ -402,8 +490,7 @@ export class MgSaicAccessory {
   setupPreconditioningHeaterCoolers() {
     // "Cabin Heat" — locked to TargetHeaterCoolerState.HEAT. Active on sends
     // startClimate with the compressor off (PTC resistive heater).
-    this.heatService = this.accessory.getService('Cabin Heat')
-      ?? this.accessory.addService(this.Service.HeaterCooler, 'Cabin Heat', 'preconditionHeat');
+    this.heatService = this.useService(this.Service.HeaterCooler, 'preconditionHeat', 'preconditionHeat');
 
     this.heatService.getCharacteristic(this.Characteristic.Active)
       .onGet(() => (this.readHeatActive()
@@ -430,10 +517,11 @@ export class MgSaicAccessory {
       .onGet(() => this._heatTargetTemp)
       .onSet((value) => this.setHeatTemperature(value));
 
-    // "Cabin Cool" — locked to TargetHeaterCoolerState.COOL. Turning Active on is
-    // disabled unless enableExperimentalCabinCool is set; see setCoolActive.
-    this.coolService = this.accessory.getService('Cabin Cool')
-      ?? this.accessory.addService(this.Service.HeaterCooler, 'Cabin Cool', 'preconditionCool');
+    // "Cabin Cool" — locked to TargetHeaterCoolerState.COOL. Only exposed with
+    // enableExperimentalCabinCool: without it the tile could never be turned on (see
+    // setCoolActive), so it isn't shown at all and removeUnusedServices drops a cached one.
+    if (!this.enableExperimentalCabinCool) return;
+    this.coolService = this.useService(this.Service.HeaterCooler, 'preconditionCool', 'preconditionCool');
 
     this.coolService.getCharacteristic(this.Characteristic.Active)
       .onGet(() => (this.readCoolActive()
@@ -462,10 +550,8 @@ export class MgSaicAccessory {
   }
 
   setupContactSensors() {
-    this.contactServices = DOOR_FIELDS.map(([name, field]) => {
-      const subtype = field;
-      const service = this.accessory.getService(name)
-        ?? this.accessory.addService(this.Service.ContactSensor, name, subtype);
+    this.contactServices = DOOR_FIELDS.map((field) => {
+      const service = this.useService(this.Service.ContactSensor, field, field);
       service.getCharacteristic(this.Characteristic.ContactSensorState)
         .onGet(() => this.readContactState(field));
       service.getCharacteristic(this.Characteristic.StatusFault)
@@ -475,16 +561,14 @@ export class MgSaicAccessory {
   }
 
   setupTemperatureSensors() {
-    this.interiorTempService = this.accessory.getService('Interior temperature')
-      ?? this.accessory.addService(this.Service.TemperatureSensor, 'Interior temperature', 'interiorTemperature');
+    this.interiorTempService = this.useService(this.Service.TemperatureSensor, 'interiorTemperature', 'interiorTemperature');
     this.interiorTempService.getCharacteristic(this.Characteristic.CurrentTemperature)
       .setProps({ minValue: -50, maxValue: 80 })
       .onGet(() => this.readTemperature('interiorTemperature'));
     this.interiorTempService.getCharacteristic(this.Characteristic.StatusFault)
       .onGet(() => this.readTemperatureFault('interiorTemperature'));
 
-    this.exteriorTempService = this.accessory.getService('Exterior temperature')
-      ?? this.accessory.addService(this.Service.TemperatureSensor, 'Exterior temperature', 'exteriorTemperature');
+    this.exteriorTempService = this.useService(this.Service.TemperatureSensor, 'exteriorTemperature', 'exteriorTemperature');
     this.exteriorTempService.getCharacteristic(this.Characteristic.CurrentTemperature)
       .setProps({ minValue: -50, maxValue: 80 })
       .onGet(() => this.readTemperature('exteriorTemperature'));
@@ -493,68 +577,59 @@ export class MgSaicAccessory {
   }
 
   setupHeatedSeatSwitches() {
-    this.leftSeatHeatService = this.accessory.getService('Left seat heat')
-      ?? this.accessory.addService(this.Service.Switch, 'Left seat heat', 'leftSeatHeat');
+    this.leftSeatHeatService = this.useService(this.Service.Switch, 'leftSeatHeat', 'leftSeatHeat');
     this.leftSeatHeatService.getCharacteristic(this.Characteristic.On)
       .onGet(() => this.readSeatHeat('frontLeftSeatHeatLevel'))
       .onSet((value) => this.setSeatHeat('left', value));
 
-    this.rightSeatHeatService = this.accessory.getService('Right seat heat')
-      ?? this.accessory.addService(this.Service.Switch, 'Right seat heat', 'rightSeatHeat');
+    this.rightSeatHeatService = this.useService(this.Service.Switch, 'rightSeatHeat', 'rightSeatHeat');
     this.rightSeatHeatService.getCharacteristic(this.Characteristic.On)
       .onGet(() => this.readSeatHeat('frontRightSeatHeatLevel'))
       .onSet((value) => this.setSeatHeat('right', value));
   }
 
   setupRearDefrostSwitch() {
-    this.rearDefrostService = this.accessory.getService('Rear window defrost')
-      ?? this.accessory.addService(this.Service.Switch, 'Rear window defrost', 'rearDefrost');
+    this.rearDefrostService = this.useService(this.Service.Switch, 'rearDefrost', 'rearDefrost');
     this.rearDefrostService.getCharacteristic(this.Characteristic.On)
       .onGet(() => Boolean(this._lastStatus?.basicVehicleStatus?.rmtHtdRrWndSt))
       .onSet((value) => this.setRearDefrost(value));
   }
 
   setupFrontDefrostSwitch() {
-    this.frontDefrostService = this.accessory.getService('Front window defrost')
-      ?? this.accessory.addService(this.Service.Switch, 'Front window defrost', 'frontDefrost');
+    this.frontDefrostService = this.useService(this.Service.Switch, 'frontDefrost', 'frontDefrost');
     this.frontDefrostService.getCharacteristic(this.Characteristic.On)
       .onGet(() => this._frontDefrostActive)
       .onSet((value) => this.setFrontDefrost(value));
   }
 
   setupSteeringWheelHeatSwitch() {
-    this.steeringWheelHeatService = this.accessory.getService('Heated steering wheel')
-      ?? this.accessory.addService(this.Service.Switch, 'Heated steering wheel', 'steeringWheelHeat');
+    this.steeringWheelHeatService = this.useService(this.Service.Switch, 'steeringWheelHeat', 'steeringWheelHeat');
     this.steeringWheelHeatService.getCharacteristic(this.Characteristic.On)
       .onGet(() => this.readSteeringWheelHeat())
       .onSet((value) => this.setSteeringWheelHeat(value));
   }
 
   setupWindowVentilationSwitch() {
-    this.windowVentilationService = this.accessory.getService('Window ventilation')
-      ?? this.accessory.addService(this.Service.Switch, 'Window ventilation', 'windowVentilation');
+    this.windowVentilationService = this.useService(this.Service.Switch, 'windowVentilation', 'windowVentilation');
     this.windowVentilationService.getCharacteristic(this.Characteristic.On)
       .onGet(() => this.readWindowsOpen())
       .onSet((value) => this.setWindowVentilation(value));
   }
 
   setupRearSeatHeatSwitches() {
-    this.rearLeftSeatHeatService = this.accessory.getService('Rear left seat heat')
-      ?? this.accessory.addService(this.Service.Switch, 'Rear left seat heat', 'rearLeftSeatHeat');
+    this.rearLeftSeatHeatService = this.useService(this.Service.Switch, 'rearLeftSeatHeat', 'rearLeftSeatHeat');
     this.rearLeftSeatHeatService.getCharacteristic(this.Characteristic.On)
       .onGet(() => this.readSeatHeat('secondRowLeftSeatHeatLevel'))
       .onSet((value) => this.setRearSeatHeat('left', value));
 
-    this.rearRightSeatHeatService = this.accessory.getService('Rear right seat heat')
-      ?? this.accessory.addService(this.Service.Switch, 'Rear right seat heat', 'rearRightSeatHeat');
+    this.rearRightSeatHeatService = this.useService(this.Service.Switch, 'rearRightSeatHeat', 'rearRightSeatHeat');
     this.rearRightSeatHeatService.getCharacteristic(this.Characteristic.On)
       .onGet(() => this.readSeatHeat('secondRowRightSeatHeatLevel'))
       .onSet((value) => this.setRearSeatHeat('right', value));
   }
 
   setupTailgateOpener() {
-    this.tailgateService = this.accessory.getService('Tailgate')
-      ?? this.accessory.addService(this.Service.GarageDoorOpener, 'Tailgate', 'powerTailgate');
+    this.tailgateService = this.useService(this.Service.GarageDoorOpener, 'powerTailgate', 'powerTailgate');
     this.tailgateService.getCharacteristic(this.Characteristic.CurrentDoorState)
       .onGet(() => this.readTailgateCurrentState());
     this.tailgateService.getCharacteristic(this.Characteristic.TargetDoorState)
@@ -1070,7 +1145,7 @@ export class MgSaicAccessory {
   statusFieldsInUse() {
     const fields = ['lockStatus'];
     if (this.enablePreconditioning) fields.push('remoteClimateStatus');
-    if (this.enableDoorSensors) fields.push(...DOOR_FIELDS.map(([, field]) => field));
+    if (this.enableDoorSensors) fields.push(...DOOR_FIELDS);
     if (this.enableTemperatureSensors) fields.push('interiorTemperature', 'exteriorTemperature');
     if (this.enableHeatedSeats) fields.push('frontLeftSeatHeatLevel', 'frontRightSeatHeatLevel');
     if (this.enableRearDefrost) fields.push('rmtHtdRrWndSt');
@@ -1260,8 +1335,8 @@ export class MgSaicAccessory {
 
   pushStatusCharacteristics() {
     this.lockService.updateCharacteristic(this.Characteristic.LockCurrentState, this.readLockState());
-    if (this.enablePreconditioning) {
-      const interiorTemp = this.readInteriorTempForClimate();
+    const interiorTemp = this.readInteriorTempForClimate();
+    if (this.enablePreconditioning && this.heatService) {
       this.heatService.updateCharacteristic(
         this.Characteristic.Active,
         this.readHeatActive() ? this.Characteristic.Active.ACTIVE : this.Characteristic.Active.INACTIVE,
@@ -1271,7 +1346,8 @@ export class MgSaicAccessory {
         this.readHeatActive() ? this.Characteristic.CurrentHeaterCoolerState.HEATING : this.Characteristic.CurrentHeaterCoolerState.INACTIVE,
       );
       this.heatService.updateCharacteristic(this.Characteristic.CurrentTemperature, interiorTemp);
-
+    }
+    if (this.enablePreconditioning && this.coolService) {
       this.coolService.updateCharacteristic(
         this.Characteristic.Active,
         this.readCoolActive() ? this.Characteristic.Active.ACTIVE : this.Characteristic.Active.INACTIVE,
@@ -1283,7 +1359,7 @@ export class MgSaicAccessory {
       this.coolService.updateCharacteristic(this.Characteristic.CurrentTemperature, interiorTemp);
     }
     if (this.enableDoorSensors) {
-      for (const [, field, i] of DOOR_FIELDS.map(([n, f], i) => [n, f, i])) {
+      for (const [i, field] of DOOR_FIELDS.entries()) {
         this.contactServices[i].updateCharacteristic(
           this.Characteristic.ContactSensorState, this.readContactState(field),
         );

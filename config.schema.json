@@ -39,6 +39,16 @@
         "placeholder": "MGS6 EV",
         "description": "Name of the car accessory when it is first created. Defaults to the model name the account reports (e.g. MG4 EV, MGS6 EV). An existing accessory keeps its name; rename it in the Home app."
       },
+      "language": {
+        "title": "Tile names language",
+        "type": "string",
+        "default": "en",
+        "oneOf": [
+          { "title": "English", "enum": ["en"] },
+          { "title": "Français", "enum": ["fr"] }
+        ],
+        "description": "Language of the names the tiles get in the Home app (Cabin Heat / Chauffage habitacle, Driver door / Porte conducteur...). A tile you renamed in the Home app keeps your name."
+      },
       "region": {
         "title": "Region",
         "type": "string",
@@ -71,7 +81,7 @@
         "title": "Expose cabin pre-conditioning (aircon) as Cabin Heat / Cabin Cool HeaterCoolers",
         "type": "boolean",
         "default": true,
-        "description": "The remote aircon / climate control, exposed as two separate HeaterCooler tiles: 'Cabin Heat' (confirmed working on a real MG4) and 'Cabin Cool' (turning it on is refused unless the experimental option below is set: the compressor command was confirmed to heat at maximum on a real MG4). Each has its own target temperature slider, 17 °C to 33 °C on an MG4 (the range follows the vehicle series, see below). Turning one on automatically shows the other as off, since the car only has one underlying climate system. It is also not the pre-drive feature in the newer iSmart apps. See TESTING.md. With this off you get no tile in the Home app at all."
+        "description": "The remote aircon / climate control, exposed as a 'Cabin Heat' HeaterCooler tile (confirmed working on a real MG4), plus a separate 'Cabin Cool' tile only when the experimental option below is set (the compressor command was confirmed to heat at maximum on a real MG4, so without that option the Cool tile isn't shown). Each has its own target temperature slider, 17 °C to 33 °C on an MG4 (the range follows the vehicle series, see below). Turning one on automatically shows the other as off, since the car only has one underlying climate system. It is also not the pre-drive feature in the newer iSmart apps. See TESTING.md. With this off you get no tile in the Home app at all."
       },
       "climateMinTemperature": {
         "title": "Cabin Heat / Cabin Cool slider minimum (°C, optional)",

@@ -1,5 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
-import { MgSaicAccessory, climateTemperatureRange, climateTemperatureIndex } from '../src/accessory.js';
+import {
+  MgSaicAccessory, climateTemperatureRange, climateTemperatureIndex, SERVICE_NAMES, serviceLanguage,
+} from '../src/accessory.js';
+import { makeStubAccessory } from './accessory-stub.js';
 
 // ---------------------------------------------------------------------------
 // Minimal stub for api.hap so we can construct MgSaicAccessory without
@@ -42,17 +45,9 @@ function makeHap() {
     Manufacturer: 'Manufacturer',
     Model: 'Model',
     SerialNumber: 'SerialNumber',
+    Name: 'Name',
+    ConfiguredName: 'ConfiguredName',
   };
-
-  const makeService = () => ({
-    getCharacteristic: () => ({
-      onGet: vi.fn().mockReturnThis(),
-      onSet: vi.fn().mockReturnThis(),
-      setProps: vi.fn().mockReturnThis(),
-    }),
-    updateCharacteristic: vi.fn(),
-    setCharacteristic: vi.fn().mockReturnThis(),
-  });
 
   const Service = {
     Battery: 'Battery',
@@ -78,29 +73,12 @@ function makeHap() {
   return hap;
 }
 
-function makeAccessory(overrides = {}) {
+/**
+ * A MgSaicAccessory with every option on (Cabin Cool experimental off). Pass `platformAccessory`
+ * (from makeStubAccessory, pre-filled with services) to start from a cached accessory.
+ */
+function makeAccessory(overrides = {}, { platformAccessory = makeStubAccessory('Name') } = {}) {
   const hap = makeHap();
-  const serviceCache = {};
-
-  const platformAccessory = {
-    getService: (name) => serviceCache[name] ?? null,
-    addService: (type, name) => {
-      // One shared characteristic stub per service, so a test can inspect what was set on it
-      // (e.g. setProps ranges) through service.getCharacteristic().
-      const characteristic = {
-        onGet: vi.fn().mockReturnThis(),
-        onSet: vi.fn().mockReturnThis(),
-        setProps: vi.fn().mockReturnThis(),
-      };
-      const svc = {
-        getCharacteristic: () => characteristic,
-        updateCharacteristic: vi.fn(),
-        setCharacteristic: vi.fn().mockReturnThis(),
-      };
-      serviceCache[name ?? type] = svc;
-      return svc;
-    },
-  };
 
   const client = {
     vehicleStatus: vi.fn(),
@@ -374,7 +352,7 @@ describe('setHeatActive', () => {
   });
 
   it('mirrors Active=INACTIVE onto the Cool tile when turning on', async () => {
-    const { acc, client } = makeAccessory();
+    const { acc, client } = makeAccessory({ enableExperimentalCabinCool: true });
     client.startClimate.mockResolvedValue({});
     await acc.setHeatActive(true);
     expect(acc.coolService.updateCharacteristic).toHaveBeenCalledWith(acc.Characteristic.Active, INACTIVE);
@@ -521,7 +499,7 @@ describe('setFrontDefrost', () => {
   });
 
   it('mirrors Active=INACTIVE onto Heat and Cool when turning on', async () => {
-    const { acc, client } = makeAccessory();
+    const { acc, client } = makeAccessory({ enableExperimentalCabinCool: true });
     client.startFrontDefrost.mockResolvedValue({});
     await acc.setFrontDefrost(true);
     expect(acc.heatService.updateCharacteristic).toHaveBeenCalledWith(acc.Characteristic.Active, INACTIVE);
@@ -967,7 +945,7 @@ describe('climate range on the accessory', () => {
   });
 
   it('sets both sliders to the given range', () => {
-    const { acc } = makeAccessory({ climateRange: { min: 16, max: 28 } });
+    const { acc } = makeAccessory({ climateRange: { min: 16, max: 28 }, enableExperimentalCabinCool: true });
     expect(acc.heatService.getCharacteristic().setProps)
       .toHaveBeenCalledWith({ minValue: 16, maxValue: 28, minStep: 1 });
     expect(acc.coolService.getCharacteristic().setProps)
@@ -1221,5 +1199,117 @@ describe('AccessoryInformation model', () => {
   it('falls back to MG4 when the model is unknown or blank', () => {
     expect(makeAccessory().acc.model).toBe('MG4');
     expect(makeAccessory({ model: '  ' }).acc.model).toBe('MG4');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tile names (Name + ConfiguredName) and unused services
+// ---------------------------------------------------------------------------
+
+describe('tile names', () => {
+  const named = (acc, type, subtype) => (subtype
+    ? acc.accessory.getServiceById(type, subtype)
+    : acc.accessory.getService(type));
+
+  it('gives every tile a Name and a ConfiguredName, in English by default', () => {
+    const { acc } = makeAccessory();
+    for (const [type, subtype, name] of [
+      ['Battery', undefined, 'Battery'],
+      ['LockMechanism', undefined, 'Lock'],
+      ['Outlet', undefined, 'Charging cable'],
+      ['HeaterCooler', 'preconditionHeat', 'Cabin Heat'],
+      ['ContactSensor', 'driverDoor', 'Driver door'],
+      ['Switch', 'leftSeatHeat', 'Left seat heat'],
+      ['GarageDoorOpener', 'powerTailgate', 'Tailgate'],
+    ]) {
+      const service = named(acc, type, subtype);
+      expect(service.values.get('Name')).toBe(name);
+      expect(service.values.get('ConfiguredName')).toBe(name);
+    }
+  });
+
+  it('names the tiles in French with language "fr"', () => {
+    const { acc } = makeAccessory({ language: 'fr' });
+    expect(named(acc, 'Outlet').values.get('ConfiguredName')).toBe('Câble de charge');
+    expect(named(acc, 'LockMechanism').values.get('ConfiguredName')).toBe('Verrouillage');
+    expect(named(acc, 'HeaterCooler', 'preconditionHeat').values.get('ConfiguredName')).toBe('Chauffage habitacle');
+    expect(named(acc, 'Switch', 'rearLeftSeatHeat').values.get('ConfiguredName')).toBe('Siège arrière gauche');
+  });
+
+  it('has an English and a French name for every subtype it uses', () => {
+    const { acc } = makeAccessory({ enableExperimentalCabinCool: true });
+    for (const service of acc.accessory.services) {
+      if (!service.subtype) continue;
+      expect(SERVICE_NAMES[service.subtype]).toEqual({ en: expect.any(String), fr: expect.any(String) });
+    }
+  });
+
+  it('renames a cached tile in place, found by subtype, without adding a second one', () => {
+    const cached = makeStubAccessory('Name');
+    const old = cached.addService('Switch', 'Left seat heat', 'leftSeatHeat');
+    const { acc } = makeAccessory({ language: 'fr' }, { platformAccessory: cached });
+    expect(acc.accessory.services.filter((s) => s.subtype === 'leftSeatHeat')).toEqual([old]);
+    expect(old.displayName).toBe('Siège avant gauche');
+    expect(old.values.get('Name')).toBe('Siège avant gauche');
+    expect(old.values.get('ConfiguredName')).toBe('Siège avant gauche');
+  });
+
+  it('keeps a name chosen in the Home app', () => {
+    const cached = makeStubAccessory('Name');
+    const seat = cached.addService('Switch', 'Siège avant gauche', 'leftSeatHeat');
+    seat.values.set('ConfiguredName', 'Mon siège');
+    makeAccessory({ language: 'fr' }, { platformAccessory: cached });
+    expect(seat.values.get('ConfiguredName')).toBe('Mon siège');
+  });
+
+  it('renames a tile nobody renamed when the language changes', () => {
+    const cached = makeStubAccessory('Name');
+    const seat = cached.addService('Switch', 'Left seat heat', 'leftSeatHeat');
+    seat.values.set('ConfiguredName', 'Left seat heat');
+    makeAccessory({ language: 'fr' }, { platformAccessory: cached });
+    expect(seat.values.get('ConfiguredName')).toBe('Siège avant gauche');
+  });
+
+  it('reads anything but "fr" as English', () => {
+    expect(serviceLanguage('fr')).toBe('fr');
+    for (const value of [undefined, 'en', 'FR', 'de', 1]) expect(serviceLanguage(value)).toBe('en');
+  });
+});
+
+describe('unused services', () => {
+  it('does not expose Cabin Cool unless enableExperimentalCabinCool is on', () => {
+    expect(makeAccessory().acc.coolService).toBeUndefined();
+    expect(makeAccessory({ enableExperimentalCabinCool: true }).acc.coolService).toBeDefined();
+  });
+
+  it('removes a cached Cabin Cool tile while the experimental option is off', () => {
+    const cached = makeStubAccessory('Name');
+    cached.addService('HeaterCooler', 'Cabin Cool', 'preconditionCool');
+    const { acc, log } = makeAccessory({}, { platformAccessory: cached });
+    expect(acc.accessory.getServiceById('HeaterCooler', 'preconditionCool')).toBeNull();
+    expect(log.info).toHaveBeenCalledWith(expect.stringContaining('Removing the "Cabin Cool" tile'));
+  });
+
+  it('removes a cached tile whose option is now off in config', () => {
+    const cached = makeStubAccessory('Name');
+    cached.addService('Switch', 'Rear window defrost', 'rearDefrost');
+    const { acc } = makeAccessory({ enableRearDefrost: false }, { platformAccessory: cached });
+    expect(acc.accessory.getServiceById('Switch', 'rearDefrost')).toBeNull();
+  });
+
+  it('never removes AccessoryInformation or a service it does not know', () => {
+    const cached = makeStubAccessory('Name');
+    const info = cached.addService('AccessoryInformation');
+    const foreign = cached.addService('Switch', 'Something else', 'somethingElse');
+    makeAccessory({}, { platformAccessory: cached });
+    expect(cached.services).toContain(info);
+    expect(cached.services).toContain(foreign);
+  });
+
+  it('still pushes status without a Cool tile', () => {
+    const { acc } = makeAccessory();
+    acc._lastStatus = { basicVehicleStatus: { remoteClimateStatus: 2, interiorTemperature: 20 } };
+    expect(() => acc.pushStatusCharacteristics()).not.toThrow();
+    expect(acc.heatService.updateCharacteristic).toHaveBeenCalledWith(acc.Characteristic.Active, 1);
   });
 });

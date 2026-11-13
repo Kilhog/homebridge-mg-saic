@@ -8,6 +8,7 @@ import {
 } from '../src/saic-client.js';
 import { MgSaicAccessory } from '../src/accessory.js';
 import { MgSaicPlatform, POLL_BACKOFF_MAX_FACTOR } from '../src/platform.js';
+import { makeStubAccessory } from './accessory-stub.js';
 
 // ---------------------------------------------------------------------------
 // helpers: simulated fetch outcomes
@@ -53,17 +54,9 @@ function makeHapStub() {
     })),
   });
   const Service = new Proxy({}, { get: (_, name) => name });
-  const services = {};
-  const makeService = () => {
-    const characteristic = {
-      onGet: vi.fn().mockReturnThis(), onSet: vi.fn().mockReturnThis(), setProps: vi.fn().mockReturnThis(),
-    };
-    return { getCharacteristic: () => characteristic, updateCharacteristic: vi.fn(), setCharacteristic: vi.fn().mockReturnThis() };
-  };
-  const platformAccessory = {
-    getService: (name) => services[name] ?? null,
-    addService: (type, name) => (services[name ?? type] = makeService()),
-  };
+  const platformAccessory = makeStubAccessory(Characteristic.Name);
+  // services['Driver door']: a service by its display name.
+  const services = new Proxy({}, { get: (_, name) => platformAccessory.getService(name) });
   const hap = {
     Characteristic, Service,
     uuid: { generate: (x) => x },
