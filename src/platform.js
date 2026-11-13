@@ -39,6 +39,8 @@ export class MgSaicPlatform {
     this.enableHeatedSeats = config.enableHeatedSeats ?? false;
     this.enableRearDefrost = config.enableRearDefrost ?? false;
     this.enableFrontDefrost = config.enableFrontDefrost ?? false;
+    // MG S6 EV power tailgate, exposed as a GarageDoorOpener; not yet confirmed by this plugin.
+    this.enablePowerTailgate = config.enablePowerTailgate ?? false;
     this.configuredVin = config.vin;
 
     this.client = new SaicClient(this.region, { log: this.log });
@@ -119,6 +121,7 @@ export class MgSaicPlatform {
       enableHeatedSeats: this.enableHeatedSeats,
       enableRearDefrost: this.enableRearDefrost,
       enableFrontDefrost: this.enableFrontDefrost,
+      enablePowerTailgate: this.enablePowerTailgate,
     });
 
     // The accessory constructor above adds or reuses services according to the current

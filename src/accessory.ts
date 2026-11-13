@@ -80,6 +80,14 @@
  * in case a future firmware update or a different vehicle behaves
  * differently, but nothing in this accessory calls it. See CHANGELOG.md.
  *
+ * Power tailgate (enablePowerTailgate, off by default, not yet confirmed against real
+ * hardware) is a GarageDoorOpener, not a Switch: HomeKit treats it as a secure accessory,
+ * so Siri and automations ask for confirmation / an unlocked device before moving it,
+ * like the lock. It sends the reference client's control_tailgate (rvcReqType "9", see
+ * saic-client.ts) and reads Open/Closed from bootStatus - so it also reads Open when the
+ * boot was opened by hand. While a command is in flight CurrentDoorState shows
+ * OPENING/CLOSING.
+ *
  * Locking the car while it isn't already known to be plugged in triggers a short
  * burst of extra polls (see detectLockEngaged/startLockRefreshSequence), so a
  * plug-in right after arriving home is caught within a few minutes instead of
@@ -88,7 +96,7 @@
  */
 
 import type { API, PlatformAccessory, Service, Characteristic, CharacteristicValue } from 'homebridge';
-import { SaicClient, SaicError } from './saic-client.js';
+import { SaicClient, SaicError, TAILGATE_ACTION } from './saic-client.js';
 
 // Door field→service-index mapping, used in both setupContactSensors and pushStatusCharacteristics.
 const DOOR_FIELDS: [string, string][] = [
@@ -110,6 +118,7 @@ export interface AccessoryOpts {
   enableHeatedSeats: boolean;
   enableRearDefrost: boolean;
   enableFrontDefrost: boolean;
+  enablePowerTailgate: boolean;
 }
 
 // Loosely typed shapes returned by the SAIC API endpoints.
@@ -133,6 +142,7 @@ export class MgSaicAccessory {
   private enableHeatedSeats: boolean;
   private enableRearDefrost: boolean;
   private enableFrontDefrost: boolean;
+  private enablePowerTailgate: boolean;
 
   private batteryService!: Service;
   private lockService!: Service;
@@ -146,6 +156,7 @@ export class MgSaicAccessory {
   private rightSeatHeatService?: Service;
   private rearDefrostService?: Service;
   private frontDefrostService?: Service;
+  private tailgateService?: Service;
 
   private _lastStatus:  StatusData   | null = null;
   private _lastCharging: ChargingData | null = null;
@@ -183,7 +194,7 @@ export class MgSaicAccessory {
 
   constructor(accessory: PlatformAccessory, client: SaicClient, {
     vin, log, api, enablePreconditioning, enableDoorSensors, enableTemperatureSensors,
-    enableHeatedSeats, enableRearDefrost, enableFrontDefrost,
+    enableHeatedSeats, enableRearDefrost, enableFrontDefrost, enablePowerTailgate,
   }: AccessoryOpts) {
     this.accessory   = accessory;
     this.client      = client;
@@ -199,6 +210,7 @@ export class MgSaicAccessory {
     this.enableHeatedSeats        = enableHeatedSeats;
     this.enableRearDefrost        = enableRearDefrost;
     this.enableFrontDefrost       = enableFrontDefrost;
+    this.enablePowerTailgate      = enablePowerTailgate;
 
     this.setupInfoService();
     this.setupBatteryService();
@@ -210,6 +222,7 @@ export class MgSaicAccessory {
     if (this.enableHeatedSeats)        this.setupHeatedSeatSwitches();
     if (this.enableRearDefrost)        this.setupRearDefrostSwitch();
     if (this.enableFrontDefrost)       this.setupFrontDefrostSwitch();
+    if (this.enablePowerTailgate)      this.setupTailgateOpener();
     this.logExposedServices();
   }
 
@@ -232,6 +245,7 @@ export class MgSaicAccessory {
     record(this.enableHeatedSeats,        'Heated seats');
     record(this.enableRearDefrost,        'Rear defrost');
     record(this.enableFrontDefrost,       'Front defrost');
+    record(this.enablePowerTailgate,      'Power tailgate');
 
     this.log.info(`HomeKit services exposed: ${exposed.join(', ')}.`);
     if (disabled.length) {
@@ -411,6 +425,19 @@ export class MgSaicAccessory {
       .onSet((value) => this.setFrontDefrost(value as boolean));
   }
 
+  setupTailgateOpener(): void {
+    this.tailgateService = this.accessory.getService('Tailgate')
+      ?? this.accessory.addService(this.Service.GarageDoorOpener, 'Tailgate', 'powerTailgate');
+    this.tailgateService.getCharacteristic(this.Characteristic.CurrentDoorState)
+      .onGet(() => this.readTailgateCurrentState());
+    this.tailgateService.getCharacteristic(this.Characteristic.TargetDoorState)
+      .onGet(() => this.readTailgateTargetState())
+      .onSet((value) => this.setTailgateTarget(value === this.Characteristic.TargetDoorState.OPEN));
+    // Required by GarageDoorOpener; the car reports nothing like it.
+    this.tailgateService.getCharacteristic(this.Characteristic.ObstructionDetected)
+      .onGet(() => false);
+  }
+
   // ------------------------------------------------------------- data reads
 
   private basicStatus(): BasicStatus | undefined {
@@ -504,6 +531,20 @@ export class MgSaicAccessory {
 
   readSeatHeat(field: string): boolean {
     return Boolean(this.basicStatus()?.[field]);
+  }
+
+  /** bootStatus: 0 = closed, non-zero = open (however it was opened). */
+  readTailgateCurrentState(): CharacteristicValue {
+    return this.basicStatus()?.['bootStatus']
+      ? this.Characteristic.CurrentDoorState.OPEN
+      : this.Characteristic.CurrentDoorState.CLOSED;
+  }
+
+  /** Target follows the reported state between commands, so the tile always looks settled. */
+  readTailgateTargetState(): CharacteristicValue {
+    return this.basicStatus()?.['bootStatus']
+      ? this.Characteristic.TargetDoorState.OPEN
+      : this.Characteristic.TargetDoorState.CLOSED;
   }
 
   // --------------------------------------------------------------- lock write
@@ -728,6 +769,33 @@ export class MgSaicAccessory {
     }
   }
 
+  /**
+   * Handles a TargetDoorState change on the "Tailgate" GarageDoorOpener: sends
+   * controlTailgate OPEN (1) or CLOSE (2). Shows OPENING/CLOSING while the command is in
+   * flight; on success patches bootStatus optimistically (1 / 0) like the lock does, on
+   * failure puts CurrentDoorState back to what the car last reported.
+   */
+  async setTailgateTarget(open: boolean): Promise<void> {
+    this.log.info(`${open ? 'Opening' : 'Closing'} the power tailgate via HomeKit...`);
+    this.tailgateService?.updateCharacteristic(
+      this.Characteristic.CurrentDoorState,
+      open ? this.Characteristic.CurrentDoorState.OPENING : this.Characteristic.CurrentDoorState.CLOSING,
+    );
+    try {
+      await this.client.controlTailgate(this.vin, open ? TAILGATE_ACTION.OPEN : TAILGATE_ACTION.CLOSE);
+      this._lastStatus = {
+        ...this._lastStatus,
+        basicVehicleStatus: { ...this.basicStatus(), bootStatus: open ? 1 : 0 },
+      };
+      this.tailgateService?.updateCharacteristic(this.Characteristic.CurrentDoorState, this.readTailgateCurrentState());
+      this.log.info(`Tailgate ${open ? 'open' : 'close'} command succeeded.`);
+    } catch (err) {
+      this.log.warn(`Tailgate ${open ? 'open' : 'close'} command failed: ${(err as Error).message}`);
+      this.tailgateService?.updateCharacteristic(this.Characteristic.CurrentDoorState, this.readTailgateCurrentState());
+      throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
+  }
+
   // ---------------------------------------------------------------- polling
 
   /** Called by the platform on its poll interval. Pushes fresh values into HomeKit. */
@@ -878,6 +946,10 @@ export class MgSaicAccessory {
     }
     if (this.enableFrontDefrost && this.frontDefrostService) {
       this.frontDefrostService.updateCharacteristic(this.Characteristic.On, this._frontDefrostActive);
+    }
+    if (this.enablePowerTailgate && this.tailgateService) {
+      this.tailgateService.updateCharacteristic(this.Characteristic.CurrentDoorState, this.readTailgateCurrentState());
+      this.tailgateService.updateCharacteristic(this.Characteristic.TargetDoorState, this.readTailgateTargetState());
     }
   }
 

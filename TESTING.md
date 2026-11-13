@@ -214,6 +214,10 @@ As with the other control commands, lock the car and turn the ignition off first
 
 Window open/close was tested against a real MG4 (software version SWi165 - R11, Australia) and confirmed **not to work**, across several attempts: locked, unlocked with the driver's door held open, and freshly started. Every attempt got `code 8` back from the car, `"Request failed. Please check the vehicle status and try again."`, while lock, seat heat, and rear defrost all succeeded fine in the same sessions. There's no switch or config option for this, it's not exposed. The low-level request is still in `src/saic-client.js` (`controlWindow`/`WINDOW_ID`) in case a firmware update or a different vehicle behaves differently; if you try it and it works for you, an issue or PR is very welcome.
 
+### Power tailgate
+
+`enablePowerTailgate`, off by default, for cars with a power tailgate (e.g. MG S6 EV). **Not yet confirmed against real hardware by this plugin.** Do this with the car in sight and nothing and nobody behind it: the tailgate moves on its own. In the Home app the "Tailgate" tile is a garage door: open it, check the tailgate actually opens and the tile goes Opening → Open; close it, check it closes fully and the tile goes Closing → Closed. Then open the boot by hand and confirm the tile reads Open after the next poll. Also check a HomeKit automation or Siri asks for confirmation before moving it — that's the point of using a garage door rather than a switch.
+
 ### Lock-triggered rapid refresh — confirming it's running
 
 New in 0.9.10, and low-risk to check because it doesn't send any command to the car, it only changes how often the plugin polls the charging endpoint. With debug logging on, lock the car (fob, iSmart app, or HomeKit) while the charger isn't already known to be plugged in, and watch the logs:
@@ -245,4 +249,5 @@ This was observed for roughly 45 minutes straight, across several Homebridge res
 - Front window defrost (`enableFrontDefrost`, off by default) is new in 0.9.9 and not yet confirmed against real hardware at all — see section 5.
 - The newer iSmart apps' "pre-drive" feature is not implemented and not reverse-engineered anywhere; it would need a fresh traffic capture.
 - Window open/close doesn't work, see section 5 above. Not a config option, not a bug to chase further unless you're on different hardware/firmware.
+- Power tailgate (`enablePowerTailgate`, off by default) is ported from the reference client for the MG S6 EV and not yet confirmed against real hardware by this plugin — see section 5.
 - Only tested against a single vehicle. If your account has more than one, set the `vin` config option to pin a specific one explicitly rather than relying on "first vehicle returned."

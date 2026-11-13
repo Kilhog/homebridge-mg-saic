@@ -87,6 +87,12 @@
         "type": "boolean",
         "default": false,
         "description": "Not yet confirmed against real hardware. Off by default, see TESTING.md."
+      },
+      "enablePowerTailgate": {
+        "title": "Expose the power tailgate as a garage door opener",
+        "type": "boolean",
+        "default": false,
+        "description": "For cars with a power tailgate (e.g. MG S6 EV): open and close it from HomeKit. Exposed as a GarageDoorOpener rather than a Switch, so HomeKit treats it as a secure accessory and asks for confirmation before automations or Siri move it. Reads open/closed from the boot status, so it also shows Open when the boot was opened by hand. Not yet confirmed against real hardware by this plugin. Off by default, see TESTING.md."
       }
     }
   }

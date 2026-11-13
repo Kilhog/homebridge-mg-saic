@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented here. This project doesn't yet follow strict semantic versioning guarantees while it's pre-1.0, breaking config changes are called out explicitly below when they happen.
 
+## Unreleased
+
+- **Added a power tailgate control** (`enablePowerTailgate`, off by default, **not yet confirmed against real hardware by this plugin**), exposed as a `GarageDoorOpener` named "Tailgate" rather than a Switch, so HomeKit treats it as a secure accessory and asks for confirmation before Siri or an automation moves it. Ported from `saic-python-client-ng`'s `control_tailgate` / `TailgateAction` (from decrypted MG S6 EV traffic, UK): `rvcReqType "9"` with a single param 31 = 1 (open) or 2 (close), with **no** param 255 terminator. Open/Closed comes from `bootStatus`; Opening/Closing is shown while a command is in flight, and `bootStatus` is patched optimistically on success. The latch-release request (`openTailgate`) is unchanged.
+
 ## 0.9.10
 
 - **Added a lock-triggered rapid refresh sequence to catch a plug-in faster after arriving home.** When the car's lockStatus transitions from unlocked to locked and the charger isn't already known to be plugged in, the plugin now fires a short burst of extra polls — 1, 3, 7, 15 and 25 minutes after the lock, cumulative — instead of waiting for the next scheduled poll (which can be a long way off on a relaxed `pollIntervalMs`) or for the charging-skip streak (see 0.9.8) to run out. Each step forces a real charging check regardless of the skip streak, and the sequence stops as soon as a plug-in is seen. Ported from `mg-saic-ha`'s post-shutdown refresh sequence (lock-engaged trigger); its message-queue-driven event refresh (engine start/stop detection) was not ported — a bigger undertaking with less clear payoff for this plugin's simpler polling model.
