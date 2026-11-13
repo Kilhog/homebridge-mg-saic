@@ -7,6 +7,7 @@ import {
   LOGIN_COOLDOWN,
 } from '../src/saic-client.js';
 import { MgSaicAccessory } from '../src/accessory.js';
+import { MgSaicPlatform, POLL_BACKOFF_MAX_FACTOR } from '../src/platform.js';
 
 // ---------------------------------------------------------------------------
 // helpers: simulated fetch outcomes
@@ -44,7 +45,7 @@ const sentEventIds = (fetchMock) => fetchMock.mock.calls.map(([, init]) => init.
  * A real MgSaicAccessory on a stub HomeKit: every Characteristic constant reads as its own
  * name (LockCurrentState.UNKNOWN === 'UNKNOWN'), every Service type as its name.
  */
-function makeAccessoryHarness(client, opts = {}) {
+function makeHapStub() {
   const characteristics = {};
   const Characteristic = new Proxy({}, {
     get: (_, name) => (characteristics[name] ??= new Proxy({ name }, {
@@ -65,9 +66,15 @@ function makeAccessoryHarness(client, opts = {}) {
   };
   const hap = {
     Characteristic, Service,
+    uuid: { generate: (x) => x },
     HapStatusError: class HapStatusError extends Error { constructor(status) { super('HapStatusError'); this.hapStatus = status; } },
     HAPStatus: { SERVICE_COMMUNICATION_FAILURE: -70402 },
   };
+  return { hap, platformAccessory, services, Characteristic };
+}
+
+function makeAccessoryHarness(client, opts = {}) {
+  const { hap, platformAccessory, services, Characteristic } = makeHapStub();
   const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn() };
   const acc = new MgSaicAccessory(platformAccessory, client, {
     vin: 'VIN', log, api: { hap }, enablePreconditioning: true, enableDoorSensors: true,
@@ -490,5 +497,162 @@ describe('session renewal', () => {
     await expect(client.login('u@example.com', 'pw')).rejects.toBeInstanceOf(SaicTransportError);
     fetchMock.mockResolvedValue(loginOk('T1'));
     await expect(client.login('u@example.com', 'pw')).resolves.toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// polling: no overlap, backoff, quiet logs, stale data
+// ---------------------------------------------------------------------------
+
+/** A platform (EU, 15 min polls) on a stub Homebridge API, with its accessory registered. */
+function makePlatform() {
+  const { hap, platformAccessory } = makeHapStub();
+  const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn() };
+  const api = {
+    hap,
+    on: vi.fn(),
+    platformAccessory: function PlatformAccessory() { return platformAccessory; },
+    registerPlatformAccessories: vi.fn(),
+    updatePlatformAccessories: vi.fn(),
+  };
+  const platform = new MgSaicPlatform(log, { username: 'u@example.com', password: 'pw', region: 'EU' }, api);
+  platform.client._sleep = vi.fn().mockResolvedValue(undefined);
+  platform.client.token = 'T1';
+  platform.registerAccessory('VIN');
+  return { platform, log };
+}
+
+const lines = (fn) => fn.mock.calls.map(([m]) => m);
+
+describe('platform polling', () => {
+  it('never runs two polls at once', async () => {
+    const { platform } = makePlatform();
+    let finish;
+    platform.vehicle.refresh = vi.fn(() => new Promise((r) => { finish = r; }));
+    const first = platform.pollOnce();
+    await platform.pollOnce();
+    expect(platform.vehicle.refresh).toHaveBeenCalledTimes(1);
+    finish(true);
+    await first;
+  });
+
+  it('logs an outage once at warn, then at debug, then one recovery line', async () => {
+    const { platform, log } = makePlatform();
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(fetchFailed('UND_ERR_CONNECT_TIMEOUT')));
+    for (let i = 0; i < 3; i++) await platform.pollOnce();
+    expect(lines(log.warn).filter((m) => m.includes('SAIC API unreachable'))).toHaveLength(1);
+    expect(lines(log.debug).filter((m) => m.includes('SAIC API still unreachable'))).toHaveLength(2);
+
+    vi.stubGlobal('fetch', vi.fn(async (url) => response({
+      code: 0, data: url.includes('charging') ? { chrgMgmtData: {} } : { basicVehicleStatus: { lockStatus: 1 } },
+    })));
+    await platform.pollOnce();
+    expect(lines(log.info)).toContainEqual(expect.stringMatching(/SAIC API reachable again after 3 failed attempt\(s\)/));
+  });
+
+  it('backs the poll interval off after consecutive failures, capped, and resets on success', async () => {
+    const { platform } = makePlatform();
+    const interval = 15 * 60_000;
+    platform.vehicle.refresh = vi.fn().mockResolvedValue(false);
+    expect(platform.nextPollDelay()).toBe(interval);
+    const delays = [];
+    for (let i = 0; i < 5; i++) {
+      await platform.pollOnce();
+      delays.push(platform.nextPollDelay());
+    }
+    expect(delays).toEqual([interval, 2 * interval, 4 * interval, 4 * interval, 4 * interval]);
+    expect(4).toBe(POLL_BACKOFF_MAX_FACTOR);
+    platform.vehicle.refresh = vi.fn().mockResolvedValue(true);
+    await platform.pollOnce();
+    expect(platform.nextPollDelay()).toBe(interval);
+  });
+
+  it('schedules the next poll only after the previous one, using the backed-off delay', async () => {
+    vi.useFakeTimers();
+    const { platform } = makePlatform();
+    platform.vehicle.refresh = vi.fn().mockResolvedValue(false);
+    platform.startPolling();
+    await vi.advanceTimersByTimeAsync(10_000); // first poll
+    await vi.advanceTimersByTimeAsync(15 * 60_000); // 1 failure: normal interval
+    expect(platform.vehicle.refresh).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(15 * 60_000); // 2 failures: now 30 min
+    expect(platform.vehicle.refresh).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(15 * 60_000);
+    expect(platform.vehicle.refresh).toHaveBeenCalledTimes(3);
+  });
+
+  it('counts a failed re-login as a failed poll', async () => {
+    const { platform, log } = makePlatform();
+    platform.client.token = '';
+    platform.client.login = vi.fn().mockRejectedValue(new SaicTransportError('Network error: ENOTFOUND', 'ENOTFOUND', true));
+    platform.vehicle.refresh = vi.fn();
+    await platform.pollOnce();
+    await platform.pollOnce();
+    expect(platform.vehicle.refresh).not.toHaveBeenCalled();
+    expect(lines(log.warn)).toEqual([expect.stringContaining('login failed')]);
+  });
+});
+
+describe('accessory refresh under outages', () => {
+  const okFetch = (status = { lockStatus: 1, interiorTemperature: 20, exteriorTemperature: 10 }) => vi.fn(async (url) => response({
+    code: 0, data: url.includes('charging') ? { chrgMgmtData: { ccuOnbdChrgrPlugOn: 1 } } : { basicVehicleStatus: status },
+  }));
+
+  it('shares one refresh between overlapping callers', async () => {
+    const client = makeClient();
+    const fetchMock = okFetch();
+    vi.stubGlobal('fetch', fetchMock);
+    const { acc } = makeAccessoryHarness(client);
+    const [a, b] = await Promise.all([acc.refresh(), acc.refresh()]);
+    expect(a).toBe(true);
+    expect(b).toBe(true);
+    expect(fetchMock.mock.calls.filter(([url]) => url.includes('/vehicle/status'))).toHaveLength(1);
+  });
+
+  it('keeps serving the last values when the API is unreachable, and reports the failure', async () => {
+    const client = makeClient();
+    vi.stubGlobal('fetch', okFetch());
+    const { acc, log } = makeAccessoryHarness(client);
+    await acc.refresh();
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(fetchFailed('UND_ERR_CONNECT_TIMEOUT')));
+    expect(await acc.refresh()).toBe(false);
+    expect(acc.lastStatusError).toMatch(/UND_ERR_CONNECT_TIMEOUT/);
+    expect(acc.readLockState()).toBe('SECURED');
+    expect(acc.readTemperature('interiorTemperature')).toBe(20);
+    expect(lines(log.warn).filter((m) => m.startsWith('Status refresh failed'))).toHaveLength(0);
+  });
+
+  it('flags StatusFault on contact and temperature sensors once the data is too old', async () => {
+    vi.useFakeTimers();
+    const client = makeClient();
+    vi.stubGlobal('fetch', okFetch());
+    const { acc, services, Characteristic } = makeAccessoryHarness(client, { staleAfterMs: 45 * 60_000 });
+    await acc.refresh();
+    expect(acc.readTemperatureFault('interiorTemperature')).toBe('NO_FAULT');
+    expect(acc.readStaleFault()).toBe('NO_FAULT');
+
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(fetchFailed('ECONNREFUSED')));
+    vi.advanceTimersByTime(46 * 60_000);
+    await acc.refresh();
+    expect(acc.readTemperatureFault('interiorTemperature')).toBe('GENERAL_FAULT');
+    expect(services['Driver door'].updateCharacteristic)
+      .toHaveBeenLastCalledWith(Characteristic.StatusFault, 'GENERAL_FAULT');
+
+    vi.stubGlobal('fetch', okFetch());
+    await acc.refresh();
+    expect(services['Driver door'].updateCharacteristic)
+      .toHaveBeenLastCalledWith(Characteristic.StatusFault, 'NO_FAULT');
+  });
+
+  it('logs a failing charging endpoint once, not on every poll', async () => {
+    const client = makeClient();
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      if (url.includes('charging')) throw fetchFailed('ECONNRESET');
+      return response({ code: 0, data: { basicVehicleStatus: { lockStatus: 1 } } });
+    }));
+    const { acc, log } = makeAccessoryHarness(client);
+    await acc.refresh();
+    await acc.refresh();
+    expect(lines(log.warn).filter((m) => m.includes('Charging status unreachable'))).toHaveLength(1);
   });
 });

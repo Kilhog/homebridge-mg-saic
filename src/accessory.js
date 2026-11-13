@@ -61,6 +61,10 @@
  * HomeKit write fails, nothing is patched, the lock shows UNKNOWN rather than JAMMED, and the
  * car's state is re-read RECHECK_DELAY_MS later (scheduleStatusRecheck).
  *
+ * HomeKit keeps serving the last values while the API is unreachable; once the last good
+ * status read is older than staleAfterMs, the contact and temperature sensors show
+ * StatusFault. refresh() is single-flight. See accessory.ts for more.
+ *
  * Window open/close was tried and confirmed NOT to work: the car
  * consistently rejects the command with "Request failed. Please check the
  * vehicle status and try again." regardless of lock state, door-open state,
@@ -71,6 +75,10 @@
  */
 
 import { SaicError, SaicCommandOutcomeUnknown } from './saic-client.js';
+import { OutageLog } from './outage.js';
+
+/** 3 x the default 15 minute poll interval. */
+export const DEFAULT_STALE_AFTER_MS = 45 * 60_000;
 
 // Door field→service-index mapping, used in both setupContactSensors and pushStatusCharacteristics.
 const DOOR_FIELDS = [
@@ -94,11 +102,11 @@ export class MgSaicAccessory {
   /**
    * @param {import('homebridge').PlatformAccessory} accessory
    * @param {import('./saic-client.js').SaicClient} client
-   * @param {{ vin: string, log: any, api: any, enablePreconditioning: boolean, enableDoorSensors: boolean, enableTemperatureSensors: boolean, enableHeatedSeats: boolean, enableRearDefrost: boolean, enableFrontDefrost: boolean }} opts
+   * @param {{ vin: string, log: any, api: any, enablePreconditioning: boolean, enableDoorSensors: boolean, enableTemperatureSensors: boolean, enableHeatedSeats: boolean, enableRearDefrost: boolean, enableFrontDefrost: boolean, staleAfterMs?: number }} opts
    */
   constructor(accessory, client, {
     vin, log, api, enablePreconditioning, enableDoorSensors, enableTemperatureSensors,
-    enableHeatedSeats, enableRearDefrost, enableFrontDefrost,
+    enableHeatedSeats, enableRearDefrost, enableFrontDefrost, staleAfterMs = DEFAULT_STALE_AFTER_MS,
   }) {
     this.accessory = accessory;
     this.client = client;
@@ -114,6 +122,16 @@ export class MgSaicAccessory {
     this.enableHeatedSeats = enableHeatedSeats;
     this.enableRearDefrost = enableRearDefrost;
     this.enableFrontDefrost = enableFrontDefrost;
+    // How old the last good status read may get before sensors show StatusFault.
+    this.staleAfterMs = staleAfterMs;
+    // When /vehicle/status last succeeded (or, before that, when this accessory was created).
+    this._lastStatusAt = Date.now();
+    // Why the last status read failed, for the platform's outage log.
+    this.lastStatusError = undefined;
+    // The refresh currently running, so overlapping callers share it.
+    this._refreshInFlight = undefined;
+    // The charging endpoint fails on its own sometimes: log its streaks quietly.
+    this.chargingOutage = new OutageLog(log, 'Charging status');
     // A command whose outcome is unknown was not re-sent; find out what the car actually did.
     this._recheckTimer = undefined;
     this.client.onControlSettled = (outcome) => {
@@ -309,6 +327,8 @@ export class MgSaicAccessory {
         ?? this.accessory.addService(this.Service.ContactSensor, name, subtype);
       service.getCharacteristic(this.Characteristic.ContactSensorState)
         .onGet(() => this.readContactState(field));
+      service.getCharacteristic(this.Characteristic.StatusFault)
+        .onGet(() => this.readStaleFault());
       return service;
     });
   }
@@ -432,9 +452,21 @@ export class MgSaicAccessory {
   }
 
   readTemperatureFault(field) {
-    return this.isTemperatureValid(field)
+    return this.isTemperatureValid(field) && !this.isStatusStale()
       ? this.Characteristic.StatusFault.NO_FAULT
       : this.Characteristic.StatusFault.GENERAL_FAULT;
+  }
+
+  /** true once the last successful status read is older than staleAfterMs. */
+  isStatusStale() {
+    return Date.now() - this._lastStatusAt > this.staleAfterMs;
+  }
+
+  /** StatusFault for services whose only problem can be stale data (contact sensors). */
+  readStaleFault() {
+    return this.isStatusStale()
+      ? this.Characteristic.StatusFault.GENERAL_FAULT
+      : this.Characteristic.StatusFault.NO_FAULT;
   }
 
   readSeatHeat(field) {
@@ -669,8 +701,23 @@ export class MgSaicAccessory {
 
   // ---------------------------------------------------------------- polling
 
-  /** Called by the platform on its poll interval. Pushes fresh values into HomeKit. */
-  async refresh() {
+  /**
+   * Called by the platform on its poll interval (and by the lock sequence / post-command
+   * re-read). Resolves true when /vehicle/status answered, false otherwise (reason in
+   * lastStatusError). Single flight: a call while one is running gets that one's result.
+   */
+  refresh() {
+    if (this._refreshInFlight) {
+      this.log.debug('A refresh is already running - sharing its result instead of polling again.');
+      return this._refreshInFlight;
+    }
+    this._refreshInFlight = this.doRefresh().finally(() => {
+      this._refreshInFlight = undefined;
+    });
+    return this._refreshInFlight;
+  }
+
+  async doRefresh() {
     const lastKnownUnplugged = this._lastCharging?.chrgMgmtData?.ccuOnbdChrgrPlugOn === 0;
     const skipCharging = lastKnownUnplugged && this._chargingSkipStreak < MgSaicAccessory.CHARGING_RECHECK_CYCLES;
 
@@ -690,10 +737,14 @@ export class MgSaicAccessory {
 
     if (statusResult.status === 'fulfilled') {
       this._lastStatus = statusResult.value;
+      this._lastStatusAt = Date.now();
+      this.lastStatusError = undefined;
       this.detectLockEngaged();
       this.pushStatusCharacteristics();
     } else {
-      this.log.warn(`Status refresh failed: ${statusResult.reason.message}`);
+      // Not a warn here: the platform logs outages once, not on every failed poll.
+      this.lastStatusError = statusResult.reason.message;
+      this.log.debug(`Status refresh failed: ${this.lastStatusError}`);
     }
 
     if (skipCharging) {
@@ -702,10 +753,31 @@ export class MgSaicAccessory {
     } else if (chargingResult.status === 'fulfilled') {
       this._chargingSkipStreak = 0;
       this._lastCharging = chargingResult.value;
+      this.chargingOutage.success();
       this.pushChargingCharacteristics();
     } else {
       this._chargingSkipStreak = 0;
-      this.log.warn(`Charging refresh failed: ${chargingResult.reason.message}`);
+      this.chargingOutage.failure(chargingResult.reason.message);
+    }
+
+    this.pushStatusFaults();
+    return statusResult.status === 'fulfilled';
+  }
+
+  /** Pushes StatusFault (stale data) to the sensors that have it, after every refresh. */
+  pushStatusFaults() {
+    if (this.enableDoorSensors) {
+      for (const service of this.contactServices) {
+        service.updateCharacteristic(this.Characteristic.StatusFault, this.readStaleFault());
+      }
+    }
+    if (this.enableTemperatureSensors) {
+      this.interiorTempService.updateCharacteristic(
+        this.Characteristic.StatusFault, this.readTemperatureFault('interiorTemperature'),
+      );
+      this.exteriorTempService.updateCharacteristic(
+        this.Characteristic.StatusFault, this.readTemperatureFault('exteriorTemperature'),
+      );
     }
   }
 

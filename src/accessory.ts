@@ -86,6 +86,12 @@
  * optimistically, the lock shows UNKNOWN rather than JAMMED, and the car's actual state is
  * re-read RECHECK_DELAY_MS later (scheduleStatusRecheck) instead of waiting for the next poll.
  *
+ * HomeKit keeps serving the last values read while the API is unreachable. Once the last
+ * successful status read is older than staleAfterMs (the platform passes 3 poll
+ * intervals), the services that support it - the contact and temperature sensors - show
+ * StatusFault, so stale data doesn't pass for current. refresh() is single-flight: a poll,
+ * a lock-triggered refresh and a post-command re-read never run side by side.
+ *
  * Locking the car while it isn't already known to be plugged in triggers a short
  * burst of extra polls (see detectLockEngaged/startLockRefreshSequence), so a
  * plug-in right after arriving home is caught within a few minutes instead of
@@ -95,6 +101,7 @@
 
 import type { API, PlatformAccessory, Service, Characteristic, CharacteristicValue } from 'homebridge';
 import { SaicClient, SaicError, SaicCommandOutcomeUnknown } from './saic-client.js';
+import { OutageLog } from './outage.js';
 
 // Door field→service-index mapping, used in both setupContactSensors and pushStatusCharacteristics.
 const DOOR_FIELDS: [string, string][] = [
@@ -116,7 +123,13 @@ export interface AccessoryOpts {
   enableHeatedSeats: boolean;
   enableRearDefrost: boolean;
   enableFrontDefrost: boolean;
+  // How old the last successful status read may get before sensors show StatusFault.
+  // Defaults to DEFAULT_STALE_AFTER_MS (3 x the default 15 min poll interval).
+  staleAfterMs?: number;
 }
+
+/** 3 x the default 15 minute poll interval. */
+export const DEFAULT_STALE_AFTER_MS = 45 * 60_000;
 
 // Loosely typed shapes returned by the SAIC API endpoints.
 type StatusData    = Record<string, unknown>;
@@ -176,6 +189,15 @@ export class MgSaicAccessory {
   // One-off re-read of the car's state after a command whose outcome is unknown.
   private _recheckTimer?: NodeJS.Timeout;
   private static readonly RECHECK_DELAY_MS = 30_000;
+  // The refresh currently running, so overlapping callers share it instead of polling twice.
+  private _refreshInFlight?: Promise<boolean>;
+  // When /vehicle/status last succeeded (or, before that, when this accessory was created).
+  private _lastStatusAt = Date.now();
+  private readonly staleAfterMs: number;
+  // Why the last status read failed, for the platform's outage log.
+  lastStatusError?: string;
+  // The charging endpoint fails on its own sometimes (nothing plugged in): log its streaks quietly.
+  private readonly chargingOutage: OutageLog;
   // Stable cache for the last known-good temperature values; named explicitly
   // to avoid hidden-class churn from dynamic property assignment.
   private _lastInteriorTemperature: number | null = null;
@@ -192,7 +214,7 @@ export class MgSaicAccessory {
 
   constructor(accessory: PlatformAccessory, client: SaicClient, {
     vin, log, api, enablePreconditioning, enableDoorSensors, enableTemperatureSensors,
-    enableHeatedSeats, enableRearDefrost, enableFrontDefrost,
+    enableHeatedSeats, enableRearDefrost, enableFrontDefrost, staleAfterMs = DEFAULT_STALE_AFTER_MS,
   }: AccessoryOpts) {
     this.accessory   = accessory;
     this.client      = client;
@@ -208,6 +230,8 @@ export class MgSaicAccessory {
     this.enableHeatedSeats        = enableHeatedSeats;
     this.enableRearDefrost        = enableRearDefrost;
     this.enableFrontDefrost       = enableFrontDefrost;
+    this.staleAfterMs             = staleAfterMs;
+    this.chargingOutage           = new OutageLog(log, 'Charging status');
 
     // A command whose outcome is unknown was not re-sent; find out what the car actually did.
     this.client.onControlSettled = (outcome) => {
@@ -373,6 +397,8 @@ export class MgSaicAccessory {
         ?? this.accessory.addService(this.Service.ContactSensor, name, subtype);
       service.getCharacteristic(this.Characteristic.ContactSensorState)
         .onGet(() => this.readContactState(field));
+      service.getCharacteristic(this.Characteristic.StatusFault)
+        .onGet(() => this.readStaleFault());
       return service;
     });
   }
@@ -511,9 +537,21 @@ export class MgSaicAccessory {
   }
 
   readTemperatureFault(field: string): CharacteristicValue {
-    return this.isTemperatureValid(field)
+    return this.isTemperatureValid(field) && !this.isStatusStale()
       ? this.Characteristic.StatusFault.NO_FAULT
       : this.Characteristic.StatusFault.GENERAL_FAULT;
+  }
+
+  /** true once the last successful status read is older than staleAfterMs. */
+  isStatusStale(): boolean {
+    return Date.now() - this._lastStatusAt > this.staleAfterMs;
+  }
+
+  /** StatusFault for services whose only problem can be stale data (contact sensors). */
+  readStaleFault(): CharacteristicValue {
+    return this.isStatusStale()
+      ? this.Characteristic.StatusFault.GENERAL_FAULT
+      : this.Characteristic.StatusFault.NO_FAULT;
   }
 
   readSeatHeat(field: string): boolean {
@@ -747,8 +785,24 @@ export class MgSaicAccessory {
 
   // ---------------------------------------------------------------- polling
 
-  /** Called by the platform on its poll interval. Pushes fresh values into HomeKit. */
-  async refresh(): Promise<void> {
+  /**
+   * Called by the platform on its poll interval (and by the lock sequence / post-command
+   * re-read). Pushes fresh values into HomeKit. Resolves true when /vehicle/status answered,
+   * false when it didn't (the reason is in lastStatusError; the platform logs it). Single
+   * flight: a call while one is running gets that one's result rather than polling again.
+   */
+  refresh(): Promise<boolean> {
+    if (this._refreshInFlight) {
+      this.log.debug('A refresh is already running - sharing its result instead of polling again.');
+      return this._refreshInFlight;
+    }
+    this._refreshInFlight = this.doRefresh().finally(() => {
+      this._refreshInFlight = undefined;
+    });
+    return this._refreshInFlight;
+  }
+
+  private async doRefresh(): Promise<boolean> {
     const lastKnownUnplugged = this.chrgMgmtData()?.['ccuOnbdChrgrPlugOn'] === 0;
     const skipCharging = lastKnownUnplugged && this._chargingSkipStreak < MgSaicAccessory.CHARGING_RECHECK_CYCLES;
 
@@ -768,10 +822,14 @@ export class MgSaicAccessory {
 
     if (statusResult.status === 'fulfilled') {
       this._lastStatus = statusResult.value as StatusData;
+      this._lastStatusAt = Date.now();
+      this.lastStatusError = undefined;
       this.detectLockEngaged();
       this.pushStatusCharacteristics();
     } else {
-      this.log.warn(`Status refresh failed: ${(statusResult.reason as Error).message}`);
+      // Not a warn here: the platform logs outages once, not on every failed poll.
+      this.lastStatusError = (statusResult.reason as Error).message;
+      this.log.debug(`Status refresh failed: ${this.lastStatusError}`);
     }
 
     if (skipCharging) {
@@ -780,10 +838,31 @@ export class MgSaicAccessory {
     } else if (chargingResult.status === 'fulfilled') {
       this._chargingSkipStreak = 0;
       this._lastCharging = chargingResult.value as ChargingData;
+      this.chargingOutage.success();
       this.pushChargingCharacteristics();
     } else {
       this._chargingSkipStreak = 0;
-      this.log.warn(`Charging refresh failed: ${(chargingResult.reason as Error).message}`);
+      this.chargingOutage.failure((chargingResult.reason as Error).message);
+    }
+
+    this.pushStatusFaults();
+    return statusResult.status === 'fulfilled';
+  }
+
+  /** Pushes StatusFault (stale data) to the sensors that have it, after every refresh. */
+  pushStatusFaults(): void {
+    if (this.enableDoorSensors && this.contactServices) {
+      for (const service of this.contactServices) {
+        service.updateCharacteristic(this.Characteristic.StatusFault, this.readStaleFault());
+      }
+    }
+    if (this.enableTemperatureSensors && this.interiorTempService && this.exteriorTempService) {
+      this.interiorTempService.updateCharacteristic(
+        this.Characteristic.StatusFault, this.readTemperatureFault('interiorTemperature'),
+      );
+      this.exteriorTempService.updateCharacteristic(
+        this.Characteristic.StatusFault, this.readTemperatureFault('exteriorTemperature'),
+      );
     }
   }
 
