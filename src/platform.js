@@ -1,5 +1,5 @@
 import { SaicClient, SaicError } from './saic-client.js';
-import { MgSaicAccessory, climateTemperatureRange } from './accessory.js';
+import { MgSaicAccessory, climateTemperatureRange, serviceLanguage } from './accessory.js';
 import { OutageLog } from './outage.js';
 import { resolvePassword } from './password.js';
 
@@ -187,6 +187,8 @@ export class MgSaicPlatform {
       enablePowerTailgate: this.enablePowerTailgate,
       staleAfterMs: this.pollIntervalMs * STALE_AFTER_POLL_INTERVALS,
       useStatusCache: this.useStatusCache,
+      // Tile names in the Home app: "fr" or English (default, also for anything else).
+      language: serviceLanguage(this.config.language),
     });
 
     // The accessory constructor above adds or reuses services according to the current
