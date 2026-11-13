@@ -98,6 +98,20 @@ Defaults to 15 minutes. SAIC's gateway has been observed pausing an account for 
 
 Locking the car while the charger isn't already known to be plugged in fires a short burst of extra charging-status checks over the following 25 minutes, so a plug-in right after arriving home is picked up quickly rather than waiting out the full poll interval. See `CHANGELOG.md` (0.9.10) for details.
 
+### Network failures and outages
+
+The gateway or the network sometimes drops out for a minute or more (a real case: logins failing with `fetch failed` / `UND_ERR_CONNECT_TIMEOUT` on one gateway address, fine again a minute later). The plugin is built to ride that out without making things worse:
+
+- **Every request has a 20 s timeout**, and network errors, timeouts and HTTP 5xx/429 are treated as transient. Login, the vehicle list and the first request of a status or charging poll are retried up to 4 times with exponential backoff and jitter.
+- **A command is never sent twice.** While waiting on the car, a network error just means asking again about the same event id. The command itself is only re-sent when the error proves it never left (connect timeout, refused connection, DNS failure). Otherwise it fails with an "outcome unknown" message: the Home app shows the write failed, nothing is updated optimistically, the lock shows Unknown, and the car's real state is re-read 30 seconds later.
+- **An expired session is renewed once, mid-request.** Requests logged out together share a single login, and a login the gateway refuses holds further logins off for 1, 2, 4, 8 then 15 minutes, since SAIC allows one session per account and has paused accounts that log in too often.
+- **Polls never overlap**, and after consecutive failed polls the interval doubles, up to 4× the configured interval (15 → 30 → 60 min), back to normal on the first success. An outage is logged once as a warning, then at debug level, then one `SAIC API reachable again after N failed attempt(s) / X min` line.
+- **HomeKit keeps the last values** while the API is unreachable. Once the last good status read is older than three poll intervals, the door and temperature sensors show a fault, so stale data doesn't pass for current.
+
+### Not waking the car on every poll (`useStatusCache`, experimental)
+
+Each routine poll reads `/vehicle/status`, which wakes the car — every 15 minutes by default, which is a concern for the 12 V battery. `useStatusCache` (off by default, **not yet tried on a real car**) makes routine polls read `/vehicle/status/cache` instead: the last status SAIC stored, read without waking the car. The full status is still read on the first poll, after any command, for the post-command re-read and the lock-triggered sequence, and whenever the cached reply lacks a field an enabled service needs. In the only capture available (from the reference client) the cache has no door or temperature fields, so with door or temperature sensors enabled it falls back to the full status on every poll; the log names the missing fields once. It only saves wake-ups with those sensors off.
+
 ## Testing
 
 See [`TESTING.md`](TESTING.md) for a staged approach: verify the API client stand-alone, then run a throwaway test Homebridge instance before touching your real one, then a dedicated section on testing lock/unlock safely.

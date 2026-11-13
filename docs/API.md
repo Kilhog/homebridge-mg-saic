@@ -27,6 +27,7 @@ The endpoint surface this plugin uses:
 POST /oauth/token
 GET  /vehicle/list
 GET  /vehicle/status
+GET  /vehicle/status/cache      (only with useStatusCache, see below)
 POST /vehicle/control
 GET  /vehicle/charging/mgmtData
 ```
@@ -133,6 +134,21 @@ Response handling rules:
 - `code` 0: success, payload is in `data`.
 
 `code` 8 was originally missing from the hard-failure list and fell through to "retry". A real Homebridge log caught it doing so for a full 60 seconds: a `/vehicle/control` command the car rejects for a state precondition it won't accept comes back with the exact same `code: 8` and message on every poll, never once resolving differently, until the client gives up with a generic "Timed out after 60s waiting for the vehicle". Two different rejection messages were observed in that log, both from the same `/vehicle/control` endpoint and not tied to a specific command - `"Vehicle not locked. Please lock it and try again.(2)"` and `"Vehicle is powered on. Please turn it off and try again.(1)"`, apparently reflecting the car's actual state at the time rather than which command was sent (a seat-heat attempt got each message on different tries in the same session). Since 0.9.1 `code: 8` is treated as a hard failure like 2/3/7, so the car's actual reason surfaces immediately instead of after a minute of pointless polling. See TESTING.md for the vehicle preconditions this uncovered (lock the car / turn off the ignition before seat heat, rear defrost, or pre-conditioning).
+
+### 3. The network fails sometimes, and a command must not run twice
+
+Seen for real (13 Nov 2026, Node 22's built-in fetch): two logins in a row failed with `TypeError: fetch failed`, cause `ConnectTimeoutError` / `UND_ERR_CONNECT_TIMEOUT` after 10 s on one of the gateway's addresses, while another address answered; a minute later both worked. Node's fetch has no overall timeout of its own (undici waits up to 300 s for headers), and a network error is not an API response, so it has to be handled separately from the rules above. What this plugin does since then:
+
+- Every HTTP attempt gets a 20 s `AbortSignal.timeout`.
+- Transient failures are: fetch's `TypeError` whose `cause.code` (or, for several addresses tried, an `AggregateError`'s codes) is one of `UND_ERR_CONNECT_TIMEOUT`, `ECONNREFUSED`, `ENOTFOUND`, `EAI_AGAIN` — these prove the request **never left** — or `UND_ERR_SOCKET`, `UND_ERR_HEADERS_TIMEOUT`, `UND_ERR_BODY_TIMEOUT`, `ECONNRESET`, `ETIMEDOUT`, `EPIPE`, an abort/timeout, or HTTP 5xx/429 — after which the request **may have reached** the gateway.
+- Login, `/vehicle/list` and the first request (event id `0`) of `/vehicle/status` and `/vehicle/charging/mgmtData` are retried up to 4 times, backoff about 2, 4, 8 s with 50–100 % jitter.
+- Once an event id has been handed out, a transient failure means asking again about **the same event id** until the 60 s deadline. A fresh request is never sent in that phase.
+- The first `POST /vehicle/control` is re-sent only after a "never left" error. After any other transient failure — or when the gateway accepted the command but the car never answered within 60 s — the outcome is unknown and the command is **not** re-sent: it fails with an explicit "outcome unknown" error and the state is re-read 30 s later.
+- A 401/403 mid-request renews the session once (one login shared by every request logged out at the same time) and retries once. A login the gateway itself refuses holds further logins off for 1, 2, 4, 8 then 15 minutes.
+
+### Reading the last stored status without waking the car
+
+`GET /vehicle/status/cache`, same query as `/vehicle/status` (`vin` = SHA-256 of the VIN, `vehStatusReqType=2`), answered directly with no event-id round trip. From the reference client's `get_vehicle_status_cached` and `VehicleStatusCacheResp`: the reply carries only a subset of `basicVehicleStatus`, `gpsPosition` without speed or heading, `statusTime` (when SAIC last heard from the car, epoch seconds) and `onlineStatus` (reported to stay `1` even while the car sleeps, so it says nothing about whether the car is awake). In the reference client's captured reply, `basicVehicleStatus` has `lockStatus`, `bootStatus`, `bonnetStatus`, the four window fields, `remoteClimateStatus`, `rmtHtdRrWndSt`, tyre pressures, ranges and `mileage`, but **no door fields and no temperatures**. This plugin only uses it behind `useStatusCache` (off by default), and falls back to `/vehicle/status` whenever a field an enabled service needs is missing. **Not yet tried against a real car by this plugin.**
 
 ## Lock/unlock control
 
