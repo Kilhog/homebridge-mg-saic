@@ -802,6 +802,32 @@ describe('power tailgate', () => {
 });
 
 // ---------------------------------------------------------------------------
+// useStatusCache: the S6 services' fields count as required too
+// ---------------------------------------------------------------------------
+
+describe('statusFieldsInUse with the S6 services', () => {
+  it('includes the fields read by the heated steering wheel, windows, rear seats and tailgate', () => {
+    const { acc } = makeAccessory();
+    expect(acc.statusFieldsInUse()).toEqual(expect.arrayContaining([
+      'steeringHeatLevel', 'driverWindow', 'passengerWindow', 'rearLeftWindow', 'rearRightWindow',
+      'secondRowLeftSeatHeatLevel', 'secondRowRightSeatHeatLevel', 'bootStatus',
+    ]));
+    expect(new Set(acc.statusFieldsInUse()).size).toBe(acc.statusFieldsInUse().length);
+  });
+
+  it('leaves them out when those services are disabled', () => {
+    const { acc } = makeAccessory({
+      enableHeatedSteeringWheel: false, enableWindowVentilation: false, enableRearHeatedSeats: false,
+      enablePowerTailgate: false, enableDoorSensors: false,
+    });
+    const fields = acc.statusFieldsInUse();
+    for (const f of ['steeringHeatLevel', 'driverWindow', 'secondRowLeftSeatHeatLevel', 'bootStatus']) {
+      expect(fields).not.toContain(f);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // setHeatTemperature / setCoolTemperature
 // ---------------------------------------------------------------------------
 

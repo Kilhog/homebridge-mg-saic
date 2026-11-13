@@ -1073,7 +1073,11 @@ export class MgSaicAccessory {
     if (this.enableTemperatureSensors) fields.push('interiorTemperature', 'exteriorTemperature');
     if (this.enableHeatedSeats) fields.push('frontLeftSeatHeatLevel', 'frontRightSeatHeatLevel');
     if (this.enableRearDefrost) fields.push('rmtHtdRrWndSt');
-    return fields;
+    if (this.enableHeatedSteeringWheel) fields.push('steeringHeatLevel');
+    if (this.enableWindowVentilation) fields.push(...WINDOW_FIELDS);
+    if (this.enableRearHeatedSeats) fields.push('secondRowLeftSeatHeatLevel', 'secondRowRightSeatHeatLevel');
+    if (this.enablePowerTailgate) fields.push('bootStatus');
+    return [...new Set(fields)];
   }
 
   /** Reads the vehicle status: SAIC's cache when useStatusCache allows it, the full one otherwise. */
