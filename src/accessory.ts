@@ -80,6 +80,14 @@
  * in case a future firmware update or a different vehicle behaves
  * differently, but nothing in this accessory calls it. See CHANGELOG.md.
  *
+ * Heated steering wheel (enableHeatedSteeringWheel, off by default, not yet confirmed
+ * against real hardware) is a plain Switch ported from the reference client's
+ * control_heated_steering_wheel (rvcReqType "8", see saic-client.ts). Its state is read
+ * back from basicVehicleStatus.steeringHeatLevel, and a non-zero
+ * steeringWheelHeatFailureReason is logged as-is since its values aren't documented
+ * anywhere. The car switches the heater off by itself after about 10 minutes, so the
+ * tile can show On until the next poll catches up.
+ *
  * Locking the car while it isn't already known to be plugged in triggers a short
  * burst of extra polls (see detectLockEngaged/startLockRefreshSequence), so a
  * plug-in right after arriving home is caught within a few minutes instead of
@@ -110,6 +118,7 @@ export interface AccessoryOpts {
   enableHeatedSeats: boolean;
   enableRearDefrost: boolean;
   enableFrontDefrost: boolean;
+  enableHeatedSteeringWheel: boolean;
 }
 
 // Loosely typed shapes returned by the SAIC API endpoints.
@@ -133,6 +142,7 @@ export class MgSaicAccessory {
   private enableHeatedSeats: boolean;
   private enableRearDefrost: boolean;
   private enableFrontDefrost: boolean;
+  private enableHeatedSteeringWheel: boolean;
 
   private batteryService!: Service;
   private lockService!: Service;
@@ -146,6 +156,7 @@ export class MgSaicAccessory {
   private rightSeatHeatService?: Service;
   private rearDefrostService?: Service;
   private frontDefrostService?: Service;
+  private steeringWheelHeatService?: Service;
 
   private _lastStatus:  StatusData   | null = null;
   private _lastCharging: ChargingData | null = null;
@@ -180,10 +191,13 @@ export class MgSaicAccessory {
   // Tracks only what HomeKit last commanded for front defrost, not a value read back from
   // the car - see setFrontDefrost for why.
   private _frontDefrostActive = false;
+  // Last steeringWheelHeatFailureReason seen, so a non-zero value is logged once when it
+  // appears rather than on every poll while it stays the same.
+  private _lastSteeringWheelHeatFailureReason = 0;
 
   constructor(accessory: PlatformAccessory, client: SaicClient, {
     vin, log, api, enablePreconditioning, enableDoorSensors, enableTemperatureSensors,
-    enableHeatedSeats, enableRearDefrost, enableFrontDefrost,
+    enableHeatedSeats, enableRearDefrost, enableFrontDefrost, enableHeatedSteeringWheel,
   }: AccessoryOpts) {
     this.accessory   = accessory;
     this.client      = client;
@@ -199,6 +213,7 @@ export class MgSaicAccessory {
     this.enableHeatedSeats        = enableHeatedSeats;
     this.enableRearDefrost        = enableRearDefrost;
     this.enableFrontDefrost       = enableFrontDefrost;
+    this.enableHeatedSteeringWheel = enableHeatedSteeringWheel;
 
     this.setupInfoService();
     this.setupBatteryService();
@@ -210,6 +225,7 @@ export class MgSaicAccessory {
     if (this.enableHeatedSeats)        this.setupHeatedSeatSwitches();
     if (this.enableRearDefrost)        this.setupRearDefrostSwitch();
     if (this.enableFrontDefrost)       this.setupFrontDefrostSwitch();
+    if (this.enableHeatedSteeringWheel) this.setupSteeringWheelHeatSwitch();
     this.logExposedServices();
   }
 
@@ -232,6 +248,7 @@ export class MgSaicAccessory {
     record(this.enableHeatedSeats,        'Heated seats');
     record(this.enableRearDefrost,        'Rear defrost');
     record(this.enableFrontDefrost,       'Front defrost');
+    record(this.enableHeatedSteeringWheel, 'Heated steering wheel');
 
     this.log.info(`HomeKit services exposed: ${exposed.join(', ')}.`);
     if (disabled.length) {
@@ -411,6 +428,14 @@ export class MgSaicAccessory {
       .onSet((value) => this.setFrontDefrost(value as boolean));
   }
 
+  setupSteeringWheelHeatSwitch(): void {
+    this.steeringWheelHeatService = this.accessory.getService('Heated steering wheel')
+      ?? this.accessory.addService(this.Service.Switch, 'Heated steering wheel', 'steeringWheelHeat');
+    this.steeringWheelHeatService.getCharacteristic(this.Characteristic.On)
+      .onGet(() => this.readSteeringWheelHeat())
+      .onSet((value) => this.setSteeringWheelHeat(value as boolean));
+  }
+
   // ------------------------------------------------------------- data reads
 
   private basicStatus(): BasicStatus | undefined {
@@ -504,6 +529,26 @@ export class MgSaicAccessory {
 
   readSeatHeat(field: string): boolean {
     return Boolean(this.basicStatus()?.[field]);
+  }
+
+  /** steeringHeatLevel: 0 = off, non-zero = on (the command itself is only ever on/off). */
+  readSteeringWheelHeat(): boolean {
+    return Boolean(this.basicStatus()?.['steeringHeatLevel']);
+  }
+
+  /**
+   * Logs a non-zero steeringWheelHeatFailureReason once, when it first shows up (or changes),
+   * from either a poll or the echo of a control response. Its values aren't documented by the
+   * reference client - it only declares the field - so the raw number is logged as-is for
+   * whoever ends up decoding it.
+   */
+  private logSteeringWheelHeatFailure(status: BasicStatus | undefined): void {
+    const reason = status?.['steeringWheelHeatFailureReason'];
+    if (typeof reason !== 'number') return;
+    if (reason !== 0 && reason !== this._lastSteeringWheelHeatFailureReason) {
+      this.log.warn(`The car reported steeringWheelHeatFailureReason=${reason} for the heated steering wheel (meaning undocumented).`);
+    }
+    this._lastSteeringWheelHeatFailureReason = reason;
   }
 
   // --------------------------------------------------------------- lock write
@@ -728,6 +773,31 @@ export class MgSaicAccessory {
     }
   }
 
+  /**
+   * Handles the "Heated steering wheel" switch. Same optimistic pattern as the seat heat
+   * switches: on success, steeringHeatLevel is patched locally (1 or 0) so HomeKit reflects
+   * the command right away; the next poll replaces it with what the car actually reports,
+   * which also catches the car's own ~10 minute auto-off. If the control response echoes a
+   * basicVehicleStatus carrying a non-zero steeringWheelHeatFailureReason, that's logged.
+   */
+  async setSteeringWheelHeat(value: boolean): Promise<void> {
+    this.log.info(`${value ? 'Starting' : 'Stopping'} heated steering wheel via HomeKit...`);
+    try {
+      const result = await this.client.controlHeatedSteeringWheel(this.vin, value);
+      this.logSteeringWheelHeatFailure(
+        (result as StatusData | undefined)?.['basicVehicleStatus'] as BasicStatus | undefined,
+      );
+      this._lastStatus = {
+        ...this._lastStatus,
+        basicVehicleStatus: { ...this.basicStatus(), steeringHeatLevel: value ? 1 : 0 },
+      };
+      this.log.info('Heated steering wheel command succeeded.');
+    } catch (err) {
+      this.log.warn(`Heated steering wheel command failed: ${(err as Error).message}`);
+      throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
+  }
+
   // ---------------------------------------------------------------- polling
 
   /** Called by the platform on its poll interval. Pushes fresh values into HomeKit. */
@@ -752,6 +822,7 @@ export class MgSaicAccessory {
     if (statusResult.status === 'fulfilled') {
       this._lastStatus = statusResult.value as StatusData;
       this.detectLockEngaged();
+      if (this.enableHeatedSteeringWheel) this.logSteeringWheelHeatFailure(this.basicStatus());
       this.pushStatusCharacteristics();
     } else {
       this.log.warn(`Status refresh failed: ${(statusResult.reason as Error).message}`);
@@ -878,6 +949,9 @@ export class MgSaicAccessory {
     }
     if (this.enableFrontDefrost && this.frontDefrostService) {
       this.frontDefrostService.updateCharacteristic(this.Characteristic.On, this._frontDefrostActive);
+    }
+    if (this.enableHeatedSteeringWheel && this.steeringWheelHeatService) {
+      this.steeringWheelHeatService.updateCharacteristic(this.Characteristic.On, this.readSteeringWheelHeat());
     }
   }
 

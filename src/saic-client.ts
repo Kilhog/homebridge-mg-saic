@@ -442,6 +442,26 @@ export class SaicClient {
     });
   }
 
+  /**
+   * Heated steering wheel on/off. Ported from saic_ismart_client_ng.api.vehicle.climate's
+   * control_heated_steering_wheel (saic-python-client-ng, MIT): rvcReqType "8"
+   * (RvcReqType.HEATED_STEERING_WHEEL) with paramId 24 (RvcParamsId.HEATED_STEERING_WHEEL)
+   * set to 1 (on) or 0 (off), then the usual four-byte zero terminator (paramId 255). Per
+   * the reference client the car switches the heater off by itself after about 10 minutes,
+   * and reports its state back in basicVehicleStatus.steeringHeatLevel (a field present in
+   * the reference client's own MG S6 EV status capture). Not yet confirmed against real
+   * hardware by this plugin.
+   */
+  controlHeatedSteeringWheel(vin: string, enable: boolean): Promise<unknown> {
+    return this.vehicleControl(vin, {
+      rvcReqType: '8',
+      rvcParams: [
+        { paramId: 24,  paramValue: b64([enable ? 1 : 0]) },
+        { paramId: 255, paramValue: b64([0, 0, 0, 0]) },
+      ],
+    });
+  }
+
   // ------------------------------------------------------- climate/preconditioning
   //
   // rvcReqType "6" is climate control. paramId 19 = fan speed (0-5), 20 = temperature index,

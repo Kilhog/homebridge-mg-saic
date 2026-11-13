@@ -400,6 +400,23 @@ export class SaicClient {
     });
   }
 
+  /**
+   * Heated steering wheel on/off, ported from the reference client's
+   * control_heated_steering_wheel: rvcReqType "8", paramId 24 = 1 (on) or 0 (off), then the
+   * paramId 255 terminator. The car switches it off by itself after about 10 minutes; state
+   * comes back in basicVehicleStatus.steeringHeatLevel. See saic-client.ts for the fuller
+   * version of this comment.
+   */
+  controlHeatedSteeringWheel(vin, enable) {
+    return this.vehicleControl(vin, {
+      rvcReqType: '8',
+      rvcParams: [
+        { paramId: 24, paramValue: b64([enable ? 1 : 0]) },
+        { paramId: 255, paramValue: b64([0, 0, 0, 0]) },
+      ],
+    });
+  }
+
   // ------------------------------------------------------- climate/preconditioning
   //
   // rvcReqType "6" is climate control. paramId 19 = fan speed (0-5), 20 = temperature index,
