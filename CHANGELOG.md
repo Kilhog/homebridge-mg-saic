@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented here. This project doesn't yet follow strict semantic versioning guarantees while it's pre-1.0, breaking config changes are called out explicitly below when they happen.
 
+## Unreleased
+
+- **Added a Heated steering wheel switch** (`enableHeatedSteeringWheel`, off by default, **not yet confirmed against real hardware by this plugin**). Ported from `saic-python-client-ng`'s `control_heated_steering_wheel`: `rvcReqType "8"` with param 24 = 1 (on) or 0 (off), then the usual param 255 terminator. On/Off is read back from `basicVehicleStatus.steeringHeatLevel` and patched optimistically after a successful command, like the seat heat switches. A non-zero `steeringWheelHeatFailureReason` (from a poll or from the control response) is logged once as a warning with its raw value, since nobody has documented what the values mean. The car switches the heater off by itself after about 10 minutes.
+
 ## 0.9.10
 
 - **Added a lock-triggered rapid refresh sequence to catch a plug-in faster after arriving home.** When the car's lockStatus transitions from unlocked to locked and the charger isn't already known to be plugged in, the plugin now fires a short burst of extra polls — 1, 3, 7, 15 and 25 minutes after the lock, cumulative — instead of waiting for the next scheduled poll (which can be a long way off on a relaxed `pollIntervalMs`) or for the charging-skip streak (see 0.9.8) to run out. Each step forces a real charging check regardless of the skip streak, and the sequence stops as soon as a plug-in is seen. Ported from `mg-saic-ha`'s post-shutdown refresh sequence (lock-engaged trigger); its message-queue-driven event refresh (engine start/stop detection) was not ported — a bigger undertaking with less clear payoff for this plugin's simpler polling model.

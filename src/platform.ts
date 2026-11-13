@@ -20,6 +20,7 @@ export class MgSaicPlatform {
   private enableHeatedSeats: boolean;
   private enableRearDefrost: boolean;
   private enableFrontDefrost: boolean;
+  private enableHeatedSteeringWheel: boolean;
   private configuredVin: string | undefined;
 
   private client: SaicClient;
@@ -42,6 +43,7 @@ export class MgSaicPlatform {
       this.enableHeatedSeats        = false;
       this.enableRearDefrost        = false;
       this.enableFrontDefrost       = false;
+      this.enableHeatedSteeringWheel = false;
       this.client = new SaicClient(this.region, { log });
       return;
     }
@@ -57,6 +59,7 @@ export class MgSaicPlatform {
       this.enableHeatedSeats        = false;
       this.enableRearDefrost        = false;
       this.enableFrontDefrost       = false;
+      this.enableHeatedSteeringWheel = false;
       this.client = new SaicClient(this.region, { log });
       return;
     }
@@ -73,6 +76,8 @@ export class MgSaicPlatform {
     this.enableHeatedSeats  = (config['enableHeatedSeats']  as boolean | undefined) ?? false;
     this.enableRearDefrost  = (config['enableRearDefrost']  as boolean | undefined) ?? false;
     this.enableFrontDefrost = (config['enableFrontDefrost'] as boolean | undefined) ?? false;
+    // MG S6 EV control ported from the reference client, not yet confirmed by this plugin.
+    this.enableHeatedSteeringWheel = (config['enableHeatedSteeringWheel'] as boolean | undefined) ?? false;
     this.configuredVin      = config['vin'] as string | undefined;
 
     this.client = new SaicClient(this.region, { log });
@@ -157,6 +162,7 @@ export class MgSaicPlatform {
       enableHeatedSeats:        this.enableHeatedSeats,
       enableRearDefrost:        this.enableRearDefrost,
       enableFrontDefrost:       this.enableFrontDefrost,
+      enableHeatedSteeringWheel: this.enableHeatedSteeringWheel,
     });
 
     // The accessory constructor above adds or reuses services according to the current

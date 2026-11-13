@@ -162,6 +162,12 @@ Two caveats on how far that goes. It confirms the **requests** are right and the
 
 Straightforward on/off. Turn it on, confirm the rear windscreen's heating element actually engages (you should be able to feel warmth on the glass within a minute or two), turn it off, confirm it stops.
 
+### Heated steering wheel
+
+Added for the MG S6 EV (`enableHeatedSteeringWheel`, off by default). **Not yet confirmed against real hardware by this plugin**; the request is the reference client's `control_heated_steering_wheel`, byte for byte. Same discipline as seat heat: car locked, ignition off, one command at a time.
+
+Turn it on, check the wheel actually warms up within a minute or two, and that the next poll (or a Homebridge restart) still shows the tile On while it's running. Then turn it off and confirm it stops. Separately, leave it on and confirm the car switches it off by itself after about 10 minutes: the tile should drop back to Off on the first poll after that. If the log ever shows `steeringWheelHeatFailureReason=<n>`, note the number and what the car was doing at the time; nobody has decoded those values yet.
+
 ### Front window defrost
 
 Added in 0.9.9 (`enableFrontDefrost`, off by default). **Not yet confirmed against real hardware.** Sends the same `rvcReqType "6"` climate command as pre-conditioning, but with fan speed 5 instead of the usual 2, fixed at 22 °C (index 8) — ported from `mg-saic-client`'s own `start_front_defrost` (fan_speed=5, ac_on=True, temperature_idx=8), which documents the fixed temperature as matching what the iSmart app itself sends.
@@ -243,6 +249,7 @@ This was observed for roughly 45 minutes straight, across several Homebridge res
 
 - Pre-conditioning is now two separate HeaterCooler tiles, Cabin Heat and Cabin Cool (17–33 °C slider each), rather than one tile with a mode toggle. Cabin Cool's Active toggle is disabled — confirmed on real hardware to heat at maximum instead of cooling, see section 5. The **stop** path is still unexercised on either tile — see section 5.
 - Front window defrost (`enableFrontDefrost`, off by default) is new in 0.9.9 and not yet confirmed against real hardware at all — see section 5.
+- Heated steering wheel (`enableHeatedSteeringWheel`, off by default) is ported from the reference client for the MG S6 EV and not yet confirmed against real hardware by this plugin — see section 5.
 - The newer iSmart apps' "pre-drive" feature is not implemented and not reverse-engineered anywhere; it would need a fresh traffic capture.
 - Window open/close doesn't work, see section 5 above. Not a config option, not a bug to chase further unless you're on different hardware/firmware.
 - Only tested against a single vehicle. If your account has more than one, set the `vin` config option to pin a specific one explicitly rather than relying on "first vehicle returned."

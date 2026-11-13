@@ -102,6 +102,7 @@ function makeAccessory(overrides = {}) {
     startClimate: vi.fn(),
     stopClimate: vi.fn(),
     startFrontDefrost: vi.fn(),
+    controlHeatedSteeringWheel: vi.fn(),
   };
 
   const api = {
@@ -121,6 +122,7 @@ function makeAccessory(overrides = {}) {
     enableHeatedSeats: true,
     enableRearDefrost: true,
     enableFrontDefrost: true,
+    enableHeatedSteeringWheel: true,
     ...overrides,
   });
 
@@ -455,6 +457,83 @@ describe('setHeatActive clears front defrost', () => {
 });
 
 // ---------------------------------------------------------------------------
+// heated steering wheel
+// ---------------------------------------------------------------------------
+
+describe('readSteeringWheelHeat', () => {
+  it('is false when no data', () => {
+    const { acc } = makeAccessory();
+    expect(acc.readSteeringWheelHeat()).toBe(false);
+  });
+
+  it('follows steeringHeatLevel (0 = off, non-zero = on)', () => {
+    const { acc } = makeAccessory();
+    acc._lastStatus = { basicVehicleStatus: { steeringHeatLevel: 1 } };
+    expect(acc.readSteeringWheelHeat()).toBe(true);
+    acc._lastStatus = { basicVehicleStatus: { steeringHeatLevel: 0 } };
+    expect(acc.readSteeringWheelHeat()).toBe(false);
+  });
+});
+
+describe('setSteeringWheelHeat', () => {
+  it('sends the command and reflects the new state optimistically', async () => {
+    const { acc, client } = makeAccessory();
+    client.controlHeatedSteeringWheel.mockResolvedValue({});
+    await acc.setSteeringWheelHeat(true);
+    expect(client.controlHeatedSteeringWheel).toHaveBeenCalledWith('TESTVIN123', true);
+    expect(acc.readSteeringWheelHeat()).toBe(true);
+
+    await acc.setSteeringWheelHeat(false);
+    expect(client.controlHeatedSteeringWheel).toHaveBeenLastCalledWith('TESTVIN123', false);
+    expect(acc.readSteeringWheelHeat()).toBe(false);
+  });
+
+  it('keeps the rest of the cached status when patching steeringHeatLevel', async () => {
+    const { acc, client } = makeAccessory();
+    acc._lastStatus = { basicVehicleStatus: { lockStatus: 1 } };
+    client.controlHeatedSteeringWheel.mockResolvedValue({});
+    await acc.setSteeringWheelHeat(true);
+    expect(acc._lastStatus.basicVehicleStatus).toEqual({ lockStatus: 1, steeringHeatLevel: 1 });
+  });
+
+  it('throws a HapStatusError and leaves state unchanged when the command fails', async () => {
+    const { acc, client } = makeAccessory();
+    client.controlHeatedSteeringWheel.mockRejectedValue(new Error('timeout'));
+    await expect(acc.setSteeringWheelHeat(true)).rejects.toThrow('HapStatusError');
+    expect(acc.readSteeringWheelHeat()).toBe(false);
+  });
+
+  it('logs a non-zero steeringWheelHeatFailureReason echoed by the control response', async () => {
+    const { acc, client, log } = makeAccessory();
+    client.controlHeatedSteeringWheel.mockResolvedValue({
+      basicVehicleStatus: { steeringWheelHeatFailureReason: 2 },
+    });
+    await acc.setSteeringWheelHeat(true);
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('steeringWheelHeatFailureReason=2'));
+  });
+});
+
+describe('refresh - steeringWheelHeatFailureReason', () => {
+  it('logs a non-zero reason once, not on every poll while it stays the same', async () => {
+    const { acc, client, log } = makeAccessory();
+    client.vehicleStatus.mockResolvedValue({ basicVehicleStatus: { steeringWheelHeatFailureReason: 5 } });
+    client.chargingStatus.mockResolvedValue({ chrgMgmtData: {} });
+    await acc.refresh();
+    await acc.refresh();
+    const warned = log.warn.mock.calls.filter(([m]) => m.includes('steeringWheelHeatFailureReason'));
+    expect(warned).toHaveLength(1);
+  });
+
+  it('stays quiet when the reason is 0', async () => {
+    const { acc, client, log } = makeAccessory();
+    client.vehicleStatus.mockResolvedValue({ basicVehicleStatus: { steeringWheelHeatFailureReason: 0 } });
+    client.chargingStatus.mockResolvedValue({ chrgMgmtData: {} });
+    await acc.refresh();
+    expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining('steeringWheelHeatFailureReason'));
+  });
+});
+
+// ---------------------------------------------------------------------------
 // setHeatTemperature / setCoolTemperature
 // ---------------------------------------------------------------------------
 
@@ -541,6 +620,13 @@ describe('logExposedServices', () => {
     expect(lines(log)).toMatch(/HomeKit services exposed:.*Pre-conditioning/);
   });
 
+  it('reports the heated steering wheel as exposed or disabled', () => {
+    expect(lines(makeAccessory({ enableHeatedSteeringWheel: true }).log))
+      .toMatch(/HomeKit services exposed:.*Heated steering wheel/);
+    expect(lines(makeAccessory({ enableHeatedSteeringWheel: false }).log))
+      .toMatch(/Not exposed, disabled in config:.*Heated steering wheel/);
+  });
+
   it('reports a disabled optional service as disabled in config, not silently', () => {
     // The case this exists for: a missing tile in the Home app used to look
     // identical in the log to a service that was never configured on.
@@ -558,6 +644,7 @@ describe('logExposedServices', () => {
       enableHeatedSeats: false,
       enableRearDefrost: false,
       enableFrontDefrost: false,
+      enableHeatedSteeringWheel: false,
     });
     expect(lines(log)).toMatch(/HomeKit services exposed: Battery, Lock, Charging outlet\./);
   });
