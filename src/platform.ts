@@ -24,6 +24,7 @@ export class MgSaicPlatform {
   private enableHeatedSteeringWheel: boolean;
   private enableExperimentalCabinCool: boolean;
   private enableWindowVentilation: boolean;
+  private enableRearHeatedSeats: boolean;
   private configuredVin: string | undefined;
   private climateRange?: ClimateTemperatureRange;
 
@@ -50,6 +51,7 @@ export class MgSaicPlatform {
       this.enableHeatedSteeringWheel = false;
       this.enableExperimentalCabinCool = false;
       this.enableWindowVentilation  = false;
+      this.enableRearHeatedSeats    = false;
       this.client = new SaicClient(this.region, { log });
       return;
     }
@@ -68,6 +70,7 @@ export class MgSaicPlatform {
       this.enableHeatedSteeringWheel = false;
       this.enableExperimentalCabinCool = false;
       this.enableWindowVentilation  = false;
+      this.enableRearHeatedSeats    = false;
       this.client = new SaicClient(this.region, { log });
       return;
     }
@@ -92,6 +95,8 @@ export class MgSaicPlatform {
     // reference client's start_ac (no compressor flag) instead of being refused.
     this.enableExperimentalCabinCool = (config['enableExperimentalCabinCool'] as boolean | undefined) ?? false;
     this.enableWindowVentilation = (config['enableWindowVentilation'] as boolean | undefined) ?? false;
+    // MG S6 EV rear seats via the per-seat command, not yet confirmed by this plugin.
+    this.enableRearHeatedSeats = (config['enableRearHeatedSeats'] as boolean | undefined) ?? false;
     this.configuredVin      = config['vin'] as string | undefined;
 
     this.client = new SaicClient(this.region, { log });
@@ -196,6 +201,9 @@ export class MgSaicPlatform {
       enableExperimentalCabinCool: this.enableExperimentalCabinCool,
       climateRange:             this.climateRange,
       enableWindowVentilation:  this.enableWindowVentilation,
+      enableRearHeatedSeats:    this.enableRearHeatedSeats,
+      // Validated (1-3, default 3) by the accessory, which logs a warning if it's off.
+      frontSeatHeatLevel:       this.config['frontSeatHeatLevel'],
     });
 
     // The accessory constructor above adds or reuses services according to the current

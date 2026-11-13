@@ -47,6 +47,8 @@ export class MgSaicPlatform {
     // reference client's start_ac (no compressor flag) instead of being refused.
     this.enableExperimentalCabinCool = config.enableExperimentalCabinCool ?? false;
     this.enableWindowVentilation = config.enableWindowVentilation ?? false;
+    // MG S6 EV rear seats via the per-seat command, not yet confirmed by this plugin.
+    this.enableRearHeatedSeats = config.enableRearHeatedSeats ?? false;
     this.configuredVin = config.vin;
 
     this.client = new SaicClient(this.region, { log: this.log });
@@ -147,6 +149,9 @@ export class MgSaicPlatform {
       enableExperimentalCabinCool: this.enableExperimentalCabinCool,
       climateRange: this.climateRange,
       enableWindowVentilation: this.enableWindowVentilation,
+      enableRearHeatedSeats: this.enableRearHeatedSeats,
+      // Validated (1-3, default 3) by the accessory, which logs a warning if it's off.
+      frontSeatHeatLevel: this.config.frontSeatHeatLevel,
     });
 
     // The accessory constructor above adds or reuses services according to the current

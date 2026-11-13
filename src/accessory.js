@@ -39,6 +39,12 @@
  * functional (driver/passenger) - conflating the two would risk labelling
  * the wrong seat depending on market.
  *
+ * Rear heated seats (enableRearHeatedSeats, off by default, not yet confirmed against real
+ * hardware): two more Switches using the per-seat control_heated_seat (param 25 / 26, on =
+ * 3), read from secondRowLeftSeatHeatLevel / secondRowRightSeatHeatLevel. The front seats
+ * keep the two-seat command; frontSeatHeatLevel (1-3, default 3) is the level their On
+ * sends. See accessory.ts for the fuller version of this comment.
+ *
  * Front defrost (enableFrontDefrost, off by default, not yet confirmed against real
  * hardware) reuses the same rvcReqType "6" climate command as pre-conditioning, but with
  * fan speed 5 instead of the usual 2. Its On/Off state is tracked locally rather than
@@ -78,7 +84,7 @@
  * accessory.ts for the fuller version of this comment.
  */
 
-import { SaicError, DOOR_WINDOWS_ACTION } from './saic-client.js';
+import { SaicError, DOOR_WINDOWS_ACTION, HEATED_SEAT, REAR_HEATED_SEAT_ON_LEVEL } from './saic-client.js';
 
 // ------------------------------------------------------- climate temperature
 
@@ -151,12 +157,14 @@ export class MgSaicAccessory {
   /**
    * @param {import('homebridge').PlatformAccessory} accessory
    * @param {import('./saic-client.js').SaicClient} client
-   * @param {{ vin: string, log: any, api: any, enablePreconditioning: boolean, enableDoorSensors: boolean, enableTemperatureSensors: boolean, enableHeatedSeats: boolean, enableRearDefrost: boolean, enableFrontDefrost: boolean, enableHeatedSteeringWheel: boolean, enableWindowVentilation: boolean, enableExperimentalCabinCool?: boolean, climateRange?: { min: number, max: number } }} opts
+   * @param {{ vin: string, log: any, api: any, enablePreconditioning: boolean, enableDoorSensors: boolean, enableTemperatureSensors: boolean, enableHeatedSeats: boolean, enableRearDefrost: boolean, enableFrontDefrost: boolean, enableHeatedSteeringWheel: boolean, enableWindowVentilation: boolean, enableRearHeatedSeats: boolean, frontSeatHeatLevel?: number, enableExperimentalCabinCool?: boolean, climateRange?: { min: number, max: number } }} opts
    */
   constructor(accessory, client, {
     vin, log, api, enablePreconditioning, enableDoorSensors, enableTemperatureSensors,
     enableHeatedSeats, enableRearDefrost, enableFrontDefrost, enableHeatedSteeringWheel,
     enableWindowVentilation,
+    enableRearHeatedSeats,
+    frontSeatHeatLevel,
     enableExperimentalCabinCool = false,
     climateRange = climateTemperatureRange(),
   }) {
@@ -179,6 +187,9 @@ export class MgSaicAccessory {
     this.enableExperimentalCabinCool = enableExperimentalCabinCool;
     // Slider range for Cabin Heat / Cabin Cool, see climateTemperatureRange.
     this.climateRange = { min: climateRange.min, max: climateRange.max };
+    this.enableRearHeatedSeats = enableRearHeatedSeats;
+    // Level (1-3) a front seat heat switch's On sends; 3 unless configured.
+    this.frontSeatHeatLevel = this.validFrontSeatHeatLevel(frontSeatHeatLevel);
     // Tracks only what HomeKit last commanded for front defrost, not a value read back
     // from the car - see setFrontDefrost for why.
     this._frontDefrostActive = false;
@@ -205,6 +216,7 @@ export class MgSaicAccessory {
     if (this.enableFrontDefrost) this.setupFrontDefrostSwitch();
     if (this.enableHeatedSteeringWheel) this.setupSteeringWheelHeatSwitch();
     if (this.enableWindowVentilation) this.setupWindowVentilationSwitch();
+    if (this.enableRearHeatedSeats) this.setupRearSeatHeatSwitches();
 
     // Cached latest reads, so a slow poll of one endpoint doesn't block
     // characteristic reads for data from the other endpoint.
@@ -257,6 +269,7 @@ export class MgSaicAccessory {
     record(this.enableFrontDefrost, 'Front defrost');
     record(this.enableHeatedSteeringWheel, 'Heated steering wheel');
     record(this.enableWindowVentilation, 'Window ventilation');
+    record(this.enableRearHeatedSeats, 'Rear heated seats');
 
     this.log.info(`HomeKit services exposed: ${exposed.join(', ')}.`);
     if (disabled.length) {
@@ -269,6 +282,14 @@ export class MgSaicAccessory {
         + 'heating or cooling to the car. Not confirmed on any real car - see README.md.',
       );
     }
+  }
+
+  /** frontSeatHeatLevel must be 1, 2 or 3; anything else falls back to 3 with a warning. */
+  validFrontSeatHeatLevel(level) {
+    if (level === undefined || level === null) return 3;
+    if (typeof level === 'number' && Number.isInteger(level) && level >= 1 && level <= 3) return level;
+    this.log.warn(`Ignoring frontSeatHeatLevel ${String(level)}: it must be 1, 2 or 3. Using 3.`);
+    return 3;
   }
 
   setupInfoService() {
@@ -458,6 +479,20 @@ export class MgSaicAccessory {
       .onSet((value) => this.setWindowVentilation(value));
   }
 
+  setupRearSeatHeatSwitches() {
+    this.rearLeftSeatHeatService = this.accessory.getService('Rear left seat heat')
+      ?? this.accessory.addService(this.Service.Switch, 'Rear left seat heat', 'rearLeftSeatHeat');
+    this.rearLeftSeatHeatService.getCharacteristic(this.Characteristic.On)
+      .onGet(() => this.readSeatHeat('secondRowLeftSeatHeatLevel'))
+      .onSet((value) => this.setRearSeatHeat('left', value));
+
+    this.rearRightSeatHeatService = this.accessory.getService('Rear right seat heat')
+      ?? this.accessory.addService(this.Service.Switch, 'Rear right seat heat', 'rearRightSeatHeat');
+    this.rearRightSeatHeatService.getCharacteristic(this.Characteristic.On)
+      .onGet(() => this.readSeatHeat('secondRowRightSeatHeatLevel'))
+      .onSet((value) => this.setRearSeatHeat('right', value));
+  }
+
   // ------------------------------------------------------------- data reads
 
   readSoc() {
@@ -618,10 +653,12 @@ export class MgSaicAccessory {
    * with the one actually being changed, rather than clobbering it to off.
    */
   async setSeatHeat(side, value) {
+    // "On" is frontSeatHeatLevel (default 3) for both seats, as it was always 3 before.
+    const on = this.frontSeatHeatLevel;
     const otherField = side === 'left' ? 'frontRightSeatHeatLevel' : 'frontLeftSeatHeatLevel';
     const otherOn = Boolean(this._lastStatus?.basicVehicleStatus?.[otherField]);
-    const leftLevel = side === 'left' ? (value ? 3 : 0) : (otherOn ? 3 : 0);
-    const rightLevel = side === 'right' ? (value ? 3 : 0) : (otherOn ? 3 : 0);
+    const leftLevel = side === 'left' ? (value ? on : 0) : (otherOn ? on : 0);
+    const rightLevel = side === 'right' ? (value ? on : 0) : (otherOn ? on : 0);
     this.log.info(`Setting seat heat via HomeKit: left=${leftLevel ? 'on' : 'off'} right=${rightLevel ? 'on' : 'off'}`);
 
     try {
@@ -637,6 +674,28 @@ export class MgSaicAccessory {
       this.log.info('Seat heat command succeeded.');
     } catch (err) {
       this.log.warn(`Seat heat command failed: ${err.message}`);
+      throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
+  }
+
+  /**
+   * Handles a rear seat heat switch: one seat per request (param 25 or 26), on = 3 (what the
+   * iSmart app sends), off = 0. Optimistic like setSeatHeat.
+   */
+  async setRearSeatHeat(side, value) {
+    const seat = side === 'left' ? HEATED_SEAT.REAR_LEFT : HEATED_SEAT.REAR_RIGHT;
+    const field = side === 'left' ? 'secondRowLeftSeatHeatLevel' : 'secondRowRightSeatHeatLevel';
+    const level = value ? REAR_HEATED_SEAT_ON_LEVEL : 0;
+    this.log.info(`Setting rear ${side} seat heat via HomeKit: ${value ? 'on' : 'off'}`);
+    try {
+      await this.client.controlHeatedSeat(this.vin, seat, level);
+      this._lastStatus = {
+        ...this._lastStatus,
+        basicVehicleStatus: { ...this._lastStatus?.basicVehicleStatus, [field]: level },
+      };
+      this.log.info('Rear seat heat command succeeded.');
+    } catch (err) {
+      this.log.warn(`Rear seat heat command failed: ${err.message}`);
       throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
     }
   }
@@ -1036,6 +1095,10 @@ export class MgSaicAccessory {
     }
     if (this.enableWindowVentilation) {
       this.windowVentilationService.updateCharacteristic(this.Characteristic.On, this.readWindowsOpen());
+    }
+    if (this.enableRearHeatedSeats) {
+      this.rearLeftSeatHeatService.updateCharacteristic(this.Characteristic.On, this.readSeatHeat('secondRowLeftSeatHeatLevel'));
+      this.rearRightSeatHeatService.updateCharacteristic(this.Characteristic.On, this.readSeatHeat('secondRowRightSeatHeatLevel'));
     }
   }
 

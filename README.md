@@ -21,6 +21,7 @@ Exposes one MG EV as one HomeKit accessory with:
 - **Outlet** — charging cable plugged in (`On`) and actively drawing (`InUse`)
 - **TemperatureSensor** × 2 — interior and exterior temperature. Falls back to the last known good reading and flags `StatusFault` if the API returns an unavailable-field sentinel instead of a real value
 - **Switch** × 2 — heated seats, left and right (off by default, see below)
+- **Switch** × 2 — rear heated seats, rear left and rear right (off by default, MG S6 EV control from the reference client, not yet confirmed against real hardware, see below)
 - **Switch** — rear window defrost (off by default, see below)
 - **Switch** — front window defrost (off by default, not yet confirmed against real hardware, see below)
 - **Switch** — heated steering wheel (off by default, MG S6 EV control from the reference client, not yet confirmed against real hardware, see below)
@@ -58,6 +59,10 @@ It's also the one control that's easy to overlook: it's governed by `enablePreco
 
 **Heated steering wheel is a separate Switch (`enableHeatedSteeringWheel`, off by default, not yet confirmed against real hardware by this plugin)** — for cars that have one, such as the MG S6 EV. Ported from the reference client's `control_heated_steering_wheel`: `rvcReqType "8"` with param 24 = 1 (on) or 0 (off). The switch reads its state back from `steeringHeatLevel` in the vehicle status, and a non-zero `steeringWheelHeatFailureReason` is logged as a warning (its values aren't documented anywhere, so the raw number is logged). The car switches the heater off by itself after about 10 minutes, so the tile can stay On in the Home app until the next poll catches up.
 
+**Rear heated seats are two more Switches (`enableRearHeatedSeats`, off by default, not yet confirmed against real hardware by this plugin)** — for cars that have them, such as the MG S6 EV. They use the reference client's per-seat `control_heated_seat`: `rvcReqType "5"` with a single param (25 rear left, 26 rear right), so changing one rear seat never restates the other. Rear seats are on/off only; On sends 3, what the iSmart app sends. State is read from `secondRowLeftSeatHeatLevel` / `secondRowRightSeatHeatLevel`.
+
+The front seats keep the two-seat command confirmed on an MG4. **`frontSeatHeatLevel`** (1, 2 or 3, default 3) picks the level a front switch's On sends; 3 is what every version before this option sent. Because both front seats go in one request, a front seat that's already on is restated at this level too.
+
 **Window open/close was tried and does not work.** Same request shape as the reference client, byte-verified, but the car consistently rejects it with `code 8`, `"Request failed. Please check the vehicle status and try again."`, whether the car was locked, unlocked with the driver's door held open, or freshly started, all tried against the same MG4 (SWi165 - R11, Australia). There's no config option or switch for it; the low-level `controlWindow`/`WINDOW_ID` request is still in `src/saic-client.js` for reference, unused, in case a firmware update or a different vehicle ever behaves differently. See `CHANGELOG.md`.
 
 **Window ventilation is a separate Switch (`enableWindowVentilation`, off by default)** — the MG S6 EV's own window command, not the MG4-era one above. Ported from the reference client's `control_door_windows`: `rvcReqType "3"` with the sunroof param set to 0 (left alone), all four door windows set to 1, then the action in param 13 (0 close, 1 ventilate, 2 fully open), and no param 255 terminator. **The command format is confirmed on a real MG S6 EV** (Europe, left-hand drive, November 2026): the full-open form was accepted in about 10 seconds and all four window fields then read open. Turning the switch on sends *ventilate* (every door window opens a few centimetres), turning it off sends *close*; those two actions are not yet confirmed on the car, and fully opening the windows is deliberately not exposed. The car reports a ventilated window and a fully open one the same way, so the switch reads On whenever any door window is open, including one opened by hand, and turning it Off closes all four. Per the reference client the S6 doesn't accept single-window control this way. This is not expected to work on an MG4.
@@ -91,6 +96,8 @@ Via Homebridge Config UI X (the plugin ships a `config.schema.json`, which drive
       "enableDoorSensors": true,
       "enableTemperatureSensors": true,
       "enableHeatedSeats": false,
+      "frontSeatHeatLevel": 3,
+      "enableRearHeatedSeats": false,
       "enableRearDefrost": false,
       "enableFrontDefrost": false,
       "enableHeatedSteeringWheel": false,

@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { SaicClient, SaicError, DOOR_WINDOWS_ACTION, WINDOW_ID } from '../src/saic-client.js';
+import {
+  SaicClient, SaicError, DOOR_WINDOWS_ACTION, WINDOW_ID, HEATED_SEAT, REAR_HEATED_SEAT_ON_LEVEL,
+} from '../src/saic-client.js';
 import { sentControl, VIN } from './control-payload.js';
 
 // ---------------------------------------------------------------------------
@@ -303,5 +305,43 @@ describe('controlDoorWindows payload', () => {
       rvcReqType: '3',
       params: [[8, [0]], [9, [1]], [10, [0]], [11, [0]], [12, [0]], [13, [3]]],
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// heated seat payloads (rvcReqType "5")
+// ---------------------------------------------------------------------------
+
+describe('heated seat payloads', () => {
+  // Byte for byte what saic-python-client-ng's control_heated_seat sends
+  // (tests/test_heated_seats.py): one param for the seat, then the 255 terminator.
+  it('uses the reference client param ids per physical seat', () => {
+    expect(HEATED_SEAT).toEqual({ FRONT_LEFT: 17, FRONT_RIGHT: 18, REAR_LEFT: 25, REAR_RIGHT: 26 });
+    expect(REAR_HEATED_SEAT_ON_LEVEL).toBe(3);
+  });
+
+  for (const [name, param] of [['REAR_LEFT', 25], ['REAR_RIGHT', 26]]) {
+    it(`controlHeatedSeat(${name}) sends a single param ${param} then 255, on = 3 and off = 0`, async () => {
+      expect(await sentControl((c) => c.controlHeatedSeat(VIN, HEATED_SEAT[name], 3)))
+        .toEqual({ rvcReqType: '5', params: [[param, [3]], [255, [0, 0, 0, 0]]] });
+      expect(await sentControl((c) => c.controlHeatedSeat(VIN, HEATED_SEAT[name], 0)))
+        .toEqual({ rvcReqType: '5', params: [[param, [0]], [255, [0, 0, 0, 0]]] });
+    });
+  }
+
+  it('refuses levels outside 0-3 and unknown seats before sending anything', async () => {
+    const client = makeClient();
+    client.requestWithEventId = vi.fn();
+    await expect(client.controlHeatedSeat(VIN, HEATED_SEAT.REAR_LEFT, 4)).rejects.toThrow(RangeError);
+    await expect(client.controlHeatedSeat(VIN, HEATED_SEAT.REAR_LEFT, -1)).rejects.toThrow(RangeError);
+    await expect(client.controlHeatedSeat(VIN, 24, 1)).rejects.toThrow(RangeError);
+    expect(client.requestWithEventId).not.toHaveBeenCalled();
+  });
+
+  // control_heated_seats (both front seats) in the reference client, confirmed on an MG4:
+  // 17 = left level, 18 = right level, then 255.
+  it('leaves the two-seat front command unchanged', async () => {
+    expect(await sentControl((c) => c.controlHeatedSeats(VIN, { leftLevel: 1, rightLevel: 3 })))
+      .toEqual({ rvcReqType: '5', params: [[17, [1]], [18, [3]], [255, [0, 0, 0, 0]]] });
   });
 });

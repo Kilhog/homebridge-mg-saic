@@ -420,7 +420,10 @@ export class SaicClient {
   // rvcReqType "32" is the separate rear window defrost command (paramId 23, one byte on/off).
   // Confirmed working against a real MG4 - see the plugin's TESTING.md.
 
-  /** level is 0-3 per the reference client (0 = off); this plugin only ever sends 0 or 3. */
+  /**
+   * level is 0-3 per the reference client (0 = off). The "on" level the plugin sends comes
+   * from the frontSeatHeatLevel option (default 3, the only value used before it existed).
+   */
   controlHeatedSeats(vin: string, { leftLevel = 0, rightLevel = 0 }: { leftLevel?: number; rightLevel?: number } = {}): Promise<unknown> {
     return this.vehicleControl(vin, {
       rvcReqType: '5',
@@ -428,6 +431,34 @@ export class SaicClient {
         { paramId: 17,  paramValue: b64([leftLevel]) },
         { paramId: 18,  paramValue: b64([rightLevel]) },
         { paramId: 255, paramValue: b64([0, 0, 0, 0]) },
+      ],
+    });
+  }
+
+  /**
+   * One heated seat on its own, leaving the others alone. Ported from
+   * saic_ismart_client_ng.api.vehicle.climate's control_heated_seat (saic-python-client-ng,
+   * MIT): rvcReqType "5" with a single param for the chosen seat - HEATED_SEAT.FRONT_LEFT (17),
+   * FRONT_RIGHT (18), REAR_LEFT (25), REAR_RIGHT (26) - then the paramId 255 terminator. Front
+   * seats take 0-3; rear seats are on/off only, and the iSmart app sends
+   * REAR_HEATED_SEAT_ON_LEVEL (3) for on. The reference client documents 17/18 as physical
+   * left/right on both left- and right-hand drive (checked on a right-hand drive MG S6 EV).
+   * This plugin uses it for the rear seats only; the front seats keep controlHeatedSeats above,
+   * confirmed on an MG4. Levels outside 0-3 are refused before anything is sent, like the
+   * reference client's ValueError. Not yet confirmed against real hardware by this plugin.
+   */
+  controlHeatedSeat(vin: string, seat: number, level: number): Promise<unknown> {
+    if (!(Object.values(HEATED_SEAT) as number[]).includes(seat)) {
+      return Promise.reject(new RangeError(`Unknown heated seat param ${seat}`));
+    }
+    if (!Number.isInteger(level) || level < 0 || level > 3) {
+      return Promise.reject(new RangeError(`Heated seat level must be 0-3, got ${level}`));
+    }
+    return this.vehicleControl(vin, {
+      rvcReqType: '5',
+      rvcParams: [
+        { paramId: seat, paramValue: b64([level]) },
+        { paramId: 255,  paramValue: b64([0, 0, 0, 0]) },
       ],
     });
   }
@@ -583,6 +614,10 @@ export class SaicClient {
 }
 
 export const LOCK_ID: Record<string, number>   = { TAILGATE: 2, DOORS: 3 };
+/** paramIds for controlHeatedSeat, by physical seat (the reference client's HeatedSeat). */
+export const HEATED_SEAT = { FRONT_LEFT: 17, FRONT_RIGHT: 18, REAR_LEFT: 25, REAR_RIGHT: 26 } as const;
+/** Rear seats are on/off only; the iSmart app sends this level for "on". */
+export const REAR_HEATED_SEAT_ON_LEVEL = 3;
 export const WINDOW_ID: Record<string, number> = { SUNROOF: 8, DRIVER: 9, WINDOW_2: 10, WINDOW_3: 11, WINDOW_4: 12 };
 /** paramId 13 values for controlDoorWindows (the reference client's DoorWindowsAction). */
 export const DOOR_WINDOWS_ACTION = { CLOSE: 0, VENTILATE: 1, OPEN: 2 } as const;

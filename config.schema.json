@@ -96,6 +96,23 @@
         "default": false,
         "description": "Confirmed working against real hardware. Off by default since it's a newer control, see TESTING.md."
       },
+      "frontSeatHeatLevel": {
+        "title": "Front seat heat level when switched on",
+        "type": "integer",
+        "default": 3,
+        "oneOf": [
+          { "title": "1 (low)", "enum": [1] },
+          { "title": "2 (medium)", "enum": [2] },
+          { "title": "3 (high, the only level used before this option existed)", "enum": [3] }
+        ],
+        "description": "Level the left/right front seat heat switches send for On. Both front seats are set in one request, so a seat already on is restated at this level too."
+      },
+      "enableRearHeatedSeats": {
+        "title": "Expose rear heated seat switches (rear left/rear right)",
+        "type": "boolean",
+        "default": false,
+        "description": "For cars with heated rear seats (e.g. MG S6 EV). Uses the reference client's per-seat command; rear seats are on/off only. Not yet confirmed against real hardware by this plugin. Off by default, see TESTING.md."
+      },
       "enableRearDefrost": {
         "title": "Expose rear window defrost switch",
         "type": "boolean",

@@ -158,6 +158,12 @@ The second request carried `right=on` rather than clobbering it to off, which is
 
 Two caveats on how far that goes. It confirms the **requests** are right and the car accepted them; nobody has separately reported back that the physical seats warmed up and stayed warm, so the param-ID-to-physical-seat question in the paragraph above is still open. And both commands returned `code: 4` ("The remote control instruction failed, please try again later.") on an intermediate poll before succeeding about five seconds later — that code is genuinely transient and is meant to be retried, unlike the `code: 8` rejections above, which never resolve. Don't be tempted to treat the two the same way.
 
+### Rear heated seats
+
+`enableRearHeatedSeats`, off by default, for cars that have them (e.g. MG S6 EV). **Not yet confirmed against real hardware by this plugin.** Each switch sends one seat only (param 25 rear left, 26 rear right; on = 3). Turn on the rear left seat only and check that seat, and only that one, warms up; then the rear right; then turn one off and confirm the other stays on. Check the next poll shows the right tiles on (`secondRowLeftSeatHeatLevel` / `secondRowRightSeatHeatLevel`).
+
+If you changed `frontSeatHeatLevel` from its default 3, also check a front seat now heats at that level (the car's own seat-heat indicator shows it).
+
 ### Rear window defrost
 
 Straightforward on/off. Turn it on, confirm the rear windscreen's heating element actually engages (you should be able to feel warmth on the glass within a minute or two), turn it off, confirm it stops.
@@ -264,4 +270,5 @@ This was observed for roughly 45 minutes straight, across several Homebridge res
 - The newer iSmart apps' "pre-drive" feature is not implemented and not reverse-engineered anywhere; it would need a fresh traffic capture.
 - Window open/close doesn't work on an MG4, see section 5 above. Not a config option, not a bug to chase further unless you're on different hardware/firmware.
 - Window ventilation (`enableWindowVentilation`, MG S6 EV format): request format confirmed on an S6 with a full open; ventilate and close not yet confirmed — see section 5.
+- Rear heated seats (`enableRearHeatedSeats`, off by default) are ported from the reference client for the MG S6 EV and not yet confirmed against real hardware by this plugin — see section 5.
 - Only tested against a single vehicle. If your account has more than one, set the `vin` config option to pin a specific one explicitly rather than relying on "first vehicle returned."
