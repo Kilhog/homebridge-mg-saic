@@ -3,7 +3,7 @@
   "pluginType": "platform",
   "singular": true,
   "headerDisplay": "HomeKit control of an MG EV via the SAIC iSmart cloud API. Only one iSmart session is allowed at a time, so logging in here will sign the phone app out.",
-  "footerDisplay": "Set the account password via the MG_SAIC_PASSWORD environment variable instead of pasting it into this form where possible, so it doesn't sit unencrypted in config.json on the NAS.",
+  "footerDisplay": "Set the account password via a password file (mode 600) or the MG_SAIC_PASSWORD environment variable instead of pasting it into this form where possible, so it doesn't sit unencrypted in config.json on the NAS.",
   "schema": {
     "type": "object",
     "properties": {
@@ -23,7 +23,14 @@
         "title": "iSmart account password",
         "type": "string",
         "required": false,
-        "description": "Leave blank and set MG_SAIC_PASSWORD in the Homebridge environment instead, if possible."
+        "description": "Leave blank and use a password file or MG_SAIC_PASSWORD in the Homebridge environment instead, if possible."
+      },
+      "passwordFile": {
+        "title": "Password file",
+        "type": "string",
+        "required": false,
+        "placeholder": "/homebridge/.mg-saic-password",
+        "description": "Path to a file that holds only the password (owned by the Homebridge user, mode 600). Used when the password above is blank. Useful on Docker installs, where MG_SAIC_PASSWORD can't be set without recreating the container."
       },
       "region": {
         "title": "Region",

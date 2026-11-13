@@ -3,8 +3,9 @@ import { SaicClient, SaicError } from './saic-client.js';
 import { MgSaicAccessory, climateTemperatureRange } from './accessory.js';
 import type { ClimateTemperatureRange } from './accessory.js';
 import { OutageLog } from './outage.js';
+import { resolvePassword } from './password.js';
 
-const PLUGIN_NAME   = 'homebridge-mg-saic';
+const PLUGIN_NAME   = '@kilhog/homebridge-mg-saic';
 const PLATFORM_NAME = 'MgSaic';
 
 // After consecutive failed polls the interval doubles (from the 2nd failure on), up to this
@@ -72,9 +73,11 @@ export class MgSaicPlatform {
       return;
     }
 
-    this.password = (config['password'] as string | undefined) || process.env['MG_SAIC_PASSWORD'] || '';
+    const resolvedPassword = resolvePassword(config, this.log);
+    this.password = resolvedPassword?.password ?? '';
+    if (resolvedPassword) this.log.info(`Using the iSmart password from ${resolvedPassword.source}.`);
     if (!this.password) {
-      this.log.warn('No password configured (config.password or MG_SAIC_PASSWORD env var), MG SAIC platform will not start.');
+      this.log.warn('No password configured (config.password, config.passwordFile or MG_SAIC_PASSWORD env var), MG SAIC platform will not start.');
       this.region               = 'Australia';
       this.pollIntervalMs       = 900_000;
       this.enablePreconditioning    = false;
