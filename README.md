@@ -26,6 +26,7 @@ Exposes one MG EV as one HomeKit accessory with:
 - **Switch** — front window defrost (off by default, not yet confirmed against real hardware, see below)
 - **Switch** — heated steering wheel (off by default, MG S6 EV control from the reference client, not yet confirmed against real hardware, see below)
 - **Switch** — window ventilation, all four door windows (off by default, MG S6 EV command format, see below)
+- **GarageDoorOpener** — power tailgate, open and close (off by default, MG S6 EV control from the reference client, not yet confirmed against real hardware, see below)
 
 Deliberately left out: tyre pressures, odometer, trip data, per-window open/close. Tyre pressure, odometer and trip data have no sensible HomeKit home. Per-window open/close was tried on an MG4 and does not work, see below; the MG S6 EV's all-windows ventilation command is a separate, optional switch.
 
@@ -62,6 +63,8 @@ It's also the one control that's easy to overlook: it's governed by `enablePreco
 **Rear heated seats are two more Switches (`enableRearHeatedSeats`, off by default, not yet confirmed against real hardware by this plugin)** — for cars that have them, such as the MG S6 EV. They use the reference client's per-seat `control_heated_seat`: `rvcReqType "5"` with a single param (25 rear left, 26 rear right), so changing one rear seat never restates the other. Rear seats are on/off only; On sends 3, what the iSmart app sends. State is read from `secondRowLeftSeatHeatLevel` / `secondRowRightSeatHeatLevel`.
 
 The front seats keep the two-seat command confirmed on an MG4. **`frontSeatHeatLevel`** (1, 2 or 3, default 3) picks the level a front switch's On sends; 3 is what every version before this option sent. Because both front seats go in one request, a front seat that's already on is restated at this level too.
+
+**Power tailgate is a GarageDoorOpener (`enablePowerTailgate`, off by default, not yet confirmed against real hardware by this plugin)** — for cars with a power tailgate, such as the MG S6 EV. Ported from the reference client's `control_tailgate`, taken there from decrypted MG S6 EV app traffic (UK): `rvcReqType "9"` with a single param, 31 = 1 to open or 2 to close, and no param 255 terminator. It's deliberately not a Switch: HomeKit treats a garage door opener as a secure accessory, so Siri and automations ask for confirmation (or an unlocked phone) before moving it, the same way they do for the lock. Open/Closed is read from `bootStatus`, so it also shows Open when the boot was opened by hand; while a command is in flight the tile shows Opening/Closing. Cars without a power tailgate are expected to refuse the command. This is separate from the existing latch-release request (`openTailgate`, an unlock of lock 2), which is unchanged and still not exposed.
 
 **Window open/close was tried and does not work.** Same request shape as the reference client, byte-verified, but the car consistently rejects it with `code 8`, `"Request failed. Please check the vehicle status and try again."`, whether the car was locked, unlocked with the driver's door held open, or freshly started, all tried against the same MG4 (SWi165 - R11, Australia). There's no config option or switch for it; the low-level `controlWindow`/`WINDOW_ID` request is still in `src/saic-client.js` for reference, unused, in case a firmware update or a different vehicle ever behaves differently. See `CHANGELOG.md`.
 
@@ -101,7 +104,8 @@ Via Homebridge Config UI X (the plugin ships a `config.schema.json`, which drive
       "enableRearDefrost": false,
       "enableFrontDefrost": false,
       "enableHeatedSteeringWheel": false,
-      "enableWindowVentilation": false
+      "enableWindowVentilation": false,
+      "enablePowerTailgate": false
     }
   ]
 }

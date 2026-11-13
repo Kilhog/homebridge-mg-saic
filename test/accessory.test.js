@@ -36,6 +36,9 @@ function makeHap() {
     TargetHeaterCoolerState: { AUTO: 0, HEAT: 1, COOL: 2 },
     HeatingThresholdTemperature: {},
     CoolingThresholdTemperature: {},
+    CurrentDoorState: { OPEN: 0, CLOSED: 1, OPENING: 2, CLOSING: 3, STOPPED: 4 },
+    TargetDoorState: { OPEN: 0, CLOSED: 1 },
+    ObstructionDetected: {},
   };
 
   const makeService = () => ({
@@ -57,6 +60,7 @@ function makeHap() {
     Switch: 'Switch',
     ContactSensor: 'ContactSensor',
     HeaterCooler: 'HeaterCooler',
+    GarageDoorOpener: 'GarageDoorOpener',
   };
 
   const hap = {
@@ -108,6 +112,7 @@ function makeAccessory(overrides = {}) {
     controlHeatedSteeringWheel: vi.fn(),
     controlDoorWindows: vi.fn(),
     controlHeatedSeat: vi.fn(),
+    controlTailgate: vi.fn(),
   };
 
   const api = {
@@ -130,6 +135,7 @@ function makeAccessory(overrides = {}) {
     enableHeatedSteeringWheel: true,
     enableWindowVentilation: true,
     enableRearHeatedSeats: true,
+    enablePowerTailgate: true,
     enableExperimentalCabinCool: false,
     ...overrides,
   });
@@ -746,6 +752,56 @@ describe('setRearSeatHeat', () => {
 });
 
 // ---------------------------------------------------------------------------
+// power tailgate (GarageDoorOpener)
+// ---------------------------------------------------------------------------
+
+describe('power tailgate', () => {
+  it('reads Open/Closed from bootStatus, target following it', () => {
+    const { acc } = makeAccessory();
+    expect(acc.readTailgateCurrentState()).toBe(1); // CLOSED
+    expect(acc.readTailgateTargetState()).toBe(1); // CLOSED
+    acc._lastStatus = { basicVehicleStatus: { bootStatus: 1 } };
+    expect(acc.readTailgateCurrentState()).toBe(0); // OPEN
+    expect(acc.readTailgateTargetState()).toBe(0); // OPEN
+  });
+
+  it('opens with action 1, showing OPENING while in flight, then Open', async () => {
+    const { acc, client } = makeAccessory();
+    client.controlTailgate.mockResolvedValue({});
+    await acc.setTailgateTarget(true);
+    expect(client.controlTailgate).toHaveBeenCalledWith('TESTVIN123', 1);
+    const calls = acc.tailgateService.updateCharacteristic.mock.calls
+      .filter(([c]) => c === acc.Characteristic.CurrentDoorState).map(([, v]) => v);
+    expect(calls).toEqual([2, 0]); // OPENING, then OPEN
+    expect(acc._lastStatus.basicVehicleStatus.bootStatus).toBe(1);
+  });
+
+  it('closes with action 2', async () => {
+    const { acc, client } = makeAccessory();
+    acc._lastStatus = { basicVehicleStatus: { bootStatus: 1 } };
+    client.controlTailgate.mockResolvedValue({});
+    await acc.setTailgateTarget(false);
+    expect(client.controlTailgate).toHaveBeenCalledWith('TESTVIN123', 2);
+    expect(acc.readTailgateCurrentState()).toBe(1); // CLOSED
+  });
+
+  it('restores the reported state and throws a HapStatusError when the command fails', async () => {
+    const { acc, client } = makeAccessory();
+    client.controlTailgate.mockRejectedValue(new Error('Request failed.'));
+    await expect(acc.setTailgateTarget(true)).rejects.toThrow('HapStatusError');
+    expect(acc.tailgateService.updateCharacteristic)
+      .toHaveBeenLastCalledWith(acc.Characteristic.CurrentDoorState, 1); // back to CLOSED
+    expect(acc._lastStatus).toBeNull();
+  });
+
+  it('sets up the Tailgate service and lists it in the startup log', () => {
+    const { acc, log } = makeAccessory({ enablePowerTailgate: true });
+    expect(acc.tailgateService).toBeDefined();
+    expect(log.info.mock.calls.map(([m]) => m).join('\n')).toMatch(/HomeKit services exposed:.*Power tailgate/);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // setHeatTemperature / setCoolTemperature
 // ---------------------------------------------------------------------------
 
@@ -946,6 +1002,7 @@ describe('logExposedServices', () => {
       enableHeatedSteeringWheel: false,
       enableWindowVentilation: false,
       enableRearHeatedSeats: false,
+      enablePowerTailgate: false,
     });
     expect(lines(log)).toMatch(/HomeKit services exposed: Battery, Lock, Charging outlet\./);
   });

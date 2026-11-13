@@ -406,8 +406,29 @@ export class SaicClient {
     });
   }
 
+  /** Unlocks the tailgate only (releases its latch). A power tailgate opens with controlTailgate. */
   openTailgate(vin: string): Promise<unknown> {
     return this.unlockVehicle(vin, LOCK_ID.TAILGATE);
+  }
+
+  /**
+   * Opens or closes a power tailgate. Ported from saic_ismart_client_ng.api.vehicle.locks'
+   * control_tailgate / TailgateAction, which the reference client took from decrypted MG S6 EV
+   * iSmart traffic (UK): rvcReqType "9" (RvcReqType.TAILGATE) with a single param,
+   * 31 (RvcParamsId.TAILGATE) = TAILGATE_ACTION.OPEN (1) or CLOSE (2), and NO paramId 255
+   * terminator. On that car both were accepted, the tailgate moved, and
+   * basicVehicleStatus.bootStatus then read 1 (open) and 0 (closed); cars without a power
+   * tailgate are expected to refuse it. Unknown actions are refused before anything is sent.
+   * Not yet confirmed against real hardware by this plugin.
+   */
+  controlTailgate(vin: string, action: number): Promise<unknown> {
+    if (!(Object.values(TAILGATE_ACTION) as number[]).includes(action)) {
+      return Promise.reject(new RangeError(`Tailgate action must be 1 (open) or 2 (close), got ${action}`));
+    }
+    return this.vehicleControl(vin, {
+      rvcReqType: '9',
+      rvcParams: [{ paramId: 31, paramValue: b64([action]) }],
+    });
   }
 
   // -------------------------------------------------------- climate control
@@ -618,6 +639,8 @@ export const LOCK_ID: Record<string, number>   = { TAILGATE: 2, DOORS: 3 };
 export const HEATED_SEAT = { FRONT_LEFT: 17, FRONT_RIGHT: 18, REAR_LEFT: 25, REAR_RIGHT: 26 } as const;
 /** Rear seats are on/off only; the iSmart app sends this level for "on". */
 export const REAR_HEATED_SEAT_ON_LEVEL = 3;
+/** paramId 31 values for controlTailgate (the reference client's TailgateAction). */
+export const TAILGATE_ACTION = { OPEN: 1, CLOSE: 2 } as const;
 export const WINDOW_ID: Record<string, number> = { SUNROOF: 8, DRIVER: 9, WINDOW_2: 10, WINDOW_3: 11, WINDOW_4: 12 };
 /** paramId 13 values for controlDoorWindows (the reference client's DoorWindowsAction). */
 export const DOOR_WINDOWS_ACTION = { CLOSE: 0, VENTILATE: 1, OPEN: 2 } as const;

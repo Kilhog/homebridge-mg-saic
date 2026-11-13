@@ -170,6 +170,22 @@ Body for unlocking the doors:
 
 The response echoes a fresh `basicVehicleStatus` (same shape as `/vehicle/status`) with the updated `lockStatus`, so a client can reflect the new state immediately rather than waiting for the next poll.
 
+### Power tailgate (`rvcReqType: "9"`, no terminator)
+
+Opens or closes a power tailgate. Ported from `saic-python-client-ng`'s `control_tailgate` and `TailgateAction` (`api/vehicle/locks`), which the reference client took from decrypted MG S6 EV iSmart traffic (UK):
+
+```json
+{
+  "rvcReqType": "9",
+  "rvcParams": [
+    { "paramId": 31, "paramValue": "<AQ== open, Ag== close>" }
+  ],
+  "vin": "<sha256 hex of VIN>"
+}
+```
+
+A single param, and **no** param 255 terminator. Per the reference client, on that car both values were accepted, the tailgate moved, and `basicVehicleStatus.bootStatus` then read `1` (open) and `0` (closed); cars without a power tailgate are expected to refuse it. This is not the same as unlocking the tailgate above (`rvcReqType "2"` with lock id 2), which only releases the latch. **Not yet confirmed against real hardware by this plugin** (`enablePowerTailgate`).
+
 ## Heated seats and rear defrost
 
 Also ported from `saic-python-client-ng` (`api/vehicle/climate`), not derived from this project's own traffic capture. **Confirmed working against a real MG4 (software version SWi165 - R11, Australia).**
@@ -402,7 +418,7 @@ Field names as returned by the API, decoded meaning based on a live capture:
 | --- | --- |
 | `lockStatus` | `1` = locked, `0` = unlocked |
 | `driverDoor`, `passengerDoor`, `rearLeftDoor`, `rearRightDoor` | `0` = closed, non-zero = open |
-| `bootStatus`, `bonnetStatus` | `0` = closed, non-zero = open |
+| `bootStatus`, `bonnetStatus` | `0` = closed, non-zero = open. `bootStatus` also drives the power tailgate's Open/Closed state (off by default) |
 | `engineStatus` | `0` = off |
 | `remoteClimateStatus` | `0` = off. Drives the pre-conditioning Switch; starting is confirmed working, stopping is not yet exercised (see "Cabin pre-conditioning" above) |
 | `interiorTemperature`, `exteriorTemperature` | Degrees Celsius. Drives the two `TemperatureSensor` services. Occasionally seen returning -128 elsewhere in this response (tyre pressure fields) when a value isn't ready, so a client should treat implausible readings as unavailable rather than trusting them outright |

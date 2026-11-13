@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
-  SaicClient, SaicError, DOOR_WINDOWS_ACTION, WINDOW_ID, HEATED_SEAT, REAR_HEATED_SEAT_ON_LEVEL,
+  SaicClient, SaicError, DOOR_WINDOWS_ACTION, WINDOW_ID, HEATED_SEAT, REAR_HEATED_SEAT_ON_LEVEL, TAILGATE_ACTION,
 } from '../src/saic-client.js';
 import { sentControl, VIN } from './control-payload.js';
 
@@ -343,5 +343,35 @@ describe('heated seat payloads', () => {
   it('leaves the two-seat front command unchanged', async () => {
     expect(await sentControl((c) => c.controlHeatedSeats(VIN, { leftLevel: 1, rightLevel: 3 })))
       .toEqual({ rvcReqType: '5', params: [[17, [1]], [18, [3]], [255, [0, 0, 0, 0]]] });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// power tailgate payload (rvcReqType "9")
+// ---------------------------------------------------------------------------
+
+describe('controlTailgate payload', () => {
+  // Byte for byte what saic-python-client-ng's control_tailgate sends
+  // (tests/test_power_tailgate.py): a single param 31, NO 255 terminator.
+  for (const [name, action] of [['OPEN', 1], ['CLOSE', 2]]) {
+    it(`sends rvcReqType 9 with only param 31 = ${action} (${name})`, async () => {
+      expect(TAILGATE_ACTION[name]).toBe(action);
+      expect(await sentControl((c) => c.controlTailgate(VIN, action)))
+        .toEqual({ rvcReqType: '9', params: [[31, [action]]] });
+    });
+  }
+
+  it('refuses an unknown action instead of sending it', async () => {
+    const client = makeClient();
+    client.requestWithEventId = vi.fn();
+    await expect(client.controlTailgate(VIN, 0)).rejects.toThrow(RangeError);
+    expect(client.requestWithEventId).not.toHaveBeenCalled();
+  });
+
+  it('leaves openTailgate (latch release via unlock, lock id 2) unchanged', async () => {
+    expect(await sentControl((c) => c.openTailgate(VIN))).toEqual({
+      rvcReqType: '2',
+      params: [[4, [0]], [5, [0]], [6, [0]], [7, [2]], [255, [0, 0, 0, 0]]],
+    });
   });
 });

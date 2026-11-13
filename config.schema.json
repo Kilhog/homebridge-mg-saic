@@ -136,6 +136,12 @@
         "type": "boolean",
         "default": false,
         "description": "One Switch for all four door windows, using the MG S6 EV's window command: on opens them a few centimetres, off closes them. Fully opening is not exposed. Reads on when any door window is open, including one opened by hand. The command format is confirmed on a real MG S6 EV (full open); the ventilate and close actions are not yet. Does not work on the MG4 (see README.md). Off by default."
+      },
+      "enablePowerTailgate": {
+        "title": "Expose the power tailgate as a garage door opener",
+        "type": "boolean",
+        "default": false,
+        "description": "For cars with a power tailgate (e.g. MG S6 EV): open and close it from HomeKit. Exposed as a GarageDoorOpener rather than a Switch, so HomeKit treats it as a secure accessory and asks for confirmation before automations or Siri move it. Reads open/closed from the boot status, so it also shows Open when the boot was opened by hand. Not yet confirmed against real hardware by this plugin. Off by default, see TESTING.md."
       }
     }
   }

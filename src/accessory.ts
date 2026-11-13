@@ -121,6 +121,14 @@
  * anywhere. The car switches the heater off by itself after about 10 minutes, so the
  * tile can show On until the next poll catches up.
  *
+ * Power tailgate (enablePowerTailgate, off by default, not yet confirmed against real
+ * hardware) is a GarageDoorOpener, not a Switch: HomeKit treats it as a secure accessory,
+ * so Siri and automations ask for confirmation / an unlocked device before moving it,
+ * like the lock. It sends the reference client's control_tailgate (rvcReqType "9", see
+ * saic-client.ts) and reads Open/Closed from bootStatus - so it also reads Open when the
+ * boot was opened by hand. While a command is in flight CurrentDoorState shows
+ * OPENING/CLOSING.
+ *
  * Locking the car while it isn't already known to be plugged in triggers a short
  * burst of extra polls (see detectLockEngaged/startLockRefreshSequence), so a
  * plug-in right after arriving home is caught within a few minutes instead of
@@ -129,7 +137,9 @@
  */
 
 import type { API, PlatformAccessory, Service, Characteristic, CharacteristicValue } from 'homebridge';
-import { SaicClient, SaicError, DOOR_WINDOWS_ACTION, HEATED_SEAT, REAR_HEATED_SEAT_ON_LEVEL } from './saic-client.js';
+import {
+  SaicClient, SaicError, DOOR_WINDOWS_ACTION, HEATED_SEAT, REAR_HEATED_SEAT_ON_LEVEL, TAILGATE_ACTION,
+} from './saic-client.js';
 
 // Door field→service-index mapping, used in both setupContactSensors and pushStatusCharacteristics.
 const DOOR_FIELDS: [string, string][] = [
@@ -160,6 +170,7 @@ export interface AccessoryOpts {
   // Level (1-3) a front seat heat switch's On sends. Defaults to 3; anything else is
   // replaced by 3 with a warning.
   frontSeatHeatLevel?: unknown;
+  enablePowerTailgate: boolean;
   enableExperimentalCabinCool?: boolean;
   // Slider range for Cabin Heat / Cabin Cool, see climateTemperatureRange. Defaults to the
   // unknown-series range (17-33 °C) when not given.
@@ -261,6 +272,7 @@ export class MgSaicAccessory {
   private enableWindowVentilation: boolean;
   private enableRearHeatedSeats: boolean;
   readonly frontSeatHeatLevel: number;
+  private enablePowerTailgate: boolean;
 
   private batteryService!: Service;
   private lockService!: Service;
@@ -278,6 +290,7 @@ export class MgSaicAccessory {
   private windowVentilationService?: Service;
   private rearLeftSeatHeatService?: Service;
   private rearRightSeatHeatService?: Service;
+  private tailgateService?: Service;
 
   private _lastStatus:  StatusData   | null = null;
   private _lastCharging: ChargingData | null = null;
@@ -330,6 +343,7 @@ export class MgSaicAccessory {
     enableWindowVentilation,
     enableRearHeatedSeats,
     frontSeatHeatLevel,
+    enablePowerTailgate,
     enableExperimentalCabinCool = false,
     climateRange = climateTemperatureRange(),
   }: AccessoryOpts) {
@@ -355,6 +369,7 @@ export class MgSaicAccessory {
     this._coolTargetTemp = this.clampClimateTemp(this._coolTargetTemp);
     this.enableRearHeatedSeats    = enableRearHeatedSeats;
     this.frontSeatHeatLevel       = this.validFrontSeatHeatLevel(frontSeatHeatLevel);
+    this.enablePowerTailgate      = enablePowerTailgate;
 
     this.setupInfoService();
     this.setupBatteryService();
@@ -369,6 +384,7 @@ export class MgSaicAccessory {
     if (this.enableHeatedSteeringWheel) this.setupSteeringWheelHeatSwitch();
     if (this.enableWindowVentilation)  this.setupWindowVentilationSwitch();
     if (this.enableRearHeatedSeats)    this.setupRearSeatHeatSwitches();
+    if (this.enablePowerTailgate)      this.setupTailgateOpener();
     this.logExposedServices();
   }
 
@@ -394,6 +410,7 @@ export class MgSaicAccessory {
     record(this.enableHeatedSteeringWheel, 'Heated steering wheel');
     record(this.enableWindowVentilation,  'Window ventilation');
     record(this.enableRearHeatedSeats,    'Rear heated seats');
+    record(this.enablePowerTailgate,      'Power tailgate');
 
     this.log.info(`HomeKit services exposed: ${exposed.join(', ')}.`);
     if (disabled.length) {
@@ -618,6 +635,19 @@ export class MgSaicAccessory {
       .onSet((value) => this.setRearSeatHeat('right', value as boolean));
   }
 
+  setupTailgateOpener(): void {
+    this.tailgateService = this.accessory.getService('Tailgate')
+      ?? this.accessory.addService(this.Service.GarageDoorOpener, 'Tailgate', 'powerTailgate');
+    this.tailgateService.getCharacteristic(this.Characteristic.CurrentDoorState)
+      .onGet(() => this.readTailgateCurrentState());
+    this.tailgateService.getCharacteristic(this.Characteristic.TargetDoorState)
+      .onGet(() => this.readTailgateTargetState())
+      .onSet((value) => this.setTailgateTarget(value === this.Characteristic.TargetDoorState.OPEN));
+    // Required by GarageDoorOpener; the car reports nothing like it.
+    this.tailgateService.getCharacteristic(this.Characteristic.ObstructionDetected)
+      .onGet(() => false);
+  }
+
   // ------------------------------------------------------------- data reads
 
   private basicStatus(): BasicStatus | undefined {
@@ -747,6 +777,20 @@ export class MgSaicAccessory {
   readWindowsOpen(): boolean {
     const status = this.basicStatus();
     return WINDOW_FIELDS.some((field) => Boolean(status?.[field]));
+  }
+
+  /** bootStatus: 0 = closed, non-zero = open (however it was opened). */
+  readTailgateCurrentState(): CharacteristicValue {
+    return this.basicStatus()?.['bootStatus']
+      ? this.Characteristic.CurrentDoorState.OPEN
+      : this.Characteristic.CurrentDoorState.CLOSED;
+  }
+
+  /** Target follows the reported state between commands, so the tile always looks settled. */
+  readTailgateTargetState(): CharacteristicValue {
+    return this.basicStatus()?.['bootStatus']
+      ? this.Characteristic.TargetDoorState.OPEN
+      : this.Characteristic.TargetDoorState.CLOSED;
   }
 
   // --------------------------------------------------------------- lock write
@@ -1082,6 +1126,33 @@ export class MgSaicAccessory {
     }
   }
 
+  /**
+   * Handles a TargetDoorState change on the "Tailgate" GarageDoorOpener: sends
+   * controlTailgate OPEN (1) or CLOSE (2). Shows OPENING/CLOSING while the command is in
+   * flight; on success patches bootStatus optimistically (1 / 0) like the lock does, on
+   * failure puts CurrentDoorState back to what the car last reported.
+   */
+  async setTailgateTarget(open: boolean): Promise<void> {
+    this.log.info(`${open ? 'Opening' : 'Closing'} the power tailgate via HomeKit...`);
+    this.tailgateService?.updateCharacteristic(
+      this.Characteristic.CurrentDoorState,
+      open ? this.Characteristic.CurrentDoorState.OPENING : this.Characteristic.CurrentDoorState.CLOSING,
+    );
+    try {
+      await this.client.controlTailgate(this.vin, open ? TAILGATE_ACTION.OPEN : TAILGATE_ACTION.CLOSE);
+      this._lastStatus = {
+        ...this._lastStatus,
+        basicVehicleStatus: { ...this.basicStatus(), bootStatus: open ? 1 : 0 },
+      };
+      this.tailgateService?.updateCharacteristic(this.Characteristic.CurrentDoorState, this.readTailgateCurrentState());
+      this.log.info(`Tailgate ${open ? 'open' : 'close'} command succeeded.`);
+    } catch (err) {
+      this.log.warn(`Tailgate ${open ? 'open' : 'close'} command failed: ${(err as Error).message}`);
+      this.tailgateService?.updateCharacteristic(this.Characteristic.CurrentDoorState, this.readTailgateCurrentState());
+      throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
+  }
+
   // ---------------------------------------------------------------- polling
 
   /** Called by the platform on its poll interval. Pushes fresh values into HomeKit. */
@@ -1259,6 +1330,10 @@ export class MgSaicAccessory {
     if (this.enableRearHeatedSeats && this.rearLeftSeatHeatService && this.rearRightSeatHeatService) {
       this.rearLeftSeatHeatService.updateCharacteristic(this.Characteristic.On, this.readSeatHeat('secondRowLeftSeatHeatLevel'));
       this.rearRightSeatHeatService.updateCharacteristic(this.Characteristic.On, this.readSeatHeat('secondRowRightSeatHeatLevel'));
+    }
+    if (this.enablePowerTailgate && this.tailgateService) {
+      this.tailgateService.updateCharacteristic(this.Characteristic.CurrentDoorState, this.readTailgateCurrentState());
+      this.tailgateService.updateCharacteristic(this.Characteristic.TargetDoorState, this.readTailgateTargetState());
     }
   }
 

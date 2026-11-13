@@ -236,6 +236,10 @@ Window open/close was tested against a real MG4 (software version SWi165 - R11, 
 
 Do this with the car in sight and dry weather. Turn the switch on and check every door window drops a few centimetres (not all the way); the next poll should still show the switch On. Turn it off and check all four close fully. Then open one window by hand: the switch should read On after the next poll, and turning it off should close it.
 
+### Power tailgate
+
+`enablePowerTailgate`, off by default, for cars with a power tailgate (e.g. MG S6 EV). **Not yet confirmed against real hardware by this plugin.** Do this with the car in sight and nothing and nobody behind it: the tailgate moves on its own. In the Home app the "Tailgate" tile is a garage door: open it, check the tailgate actually opens and the tile goes Opening → Open; close it, check it closes fully and the tile goes Closing → Closed. Then open the boot by hand and confirm the tile reads Open after the next poll. Also check a HomeKit automation or Siri asks for confirmation before moving it — that's the point of using a garage door rather than a switch.
+
 ### Lock-triggered rapid refresh — confirming it's running
 
 New in 0.9.10, and low-risk to check because it doesn't send any command to the car, it only changes how often the plugin polls the charging endpoint. With debug logging on, lock the car (fob, iSmart app, or HomeKit) while the charger isn't already known to be plugged in, and watch the logs:
@@ -271,4 +275,5 @@ This was observed for roughly 45 minutes straight, across several Homebridge res
 - Window open/close doesn't work on an MG4, see section 5 above. Not a config option, not a bug to chase further unless you're on different hardware/firmware.
 - Window ventilation (`enableWindowVentilation`, MG S6 EV format): request format confirmed on an S6 with a full open; ventilate and close not yet confirmed — see section 5.
 - Rear heated seats (`enableRearHeatedSeats`, off by default) are ported from the reference client for the MG S6 EV and not yet confirmed against real hardware by this plugin — see section 5.
+- Power tailgate (`enablePowerTailgate`, off by default) is ported from the reference client for the MG S6 EV and not yet confirmed against real hardware by this plugin — see section 5.
 - Only tested against a single vehicle. If your account has more than one, set the `vin` config option to pin a specific one explicitly rather than relying on "first vehicle returned."
