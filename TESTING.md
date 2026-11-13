@@ -224,6 +224,12 @@ As with the other control commands, lock the car and turn the ignition off first
 
 Window open/close was tested against a real MG4 (software version SWi165 - R11, Australia) and confirmed **not to work**, across several attempts: locked, unlocked with the driver's door held open, and freshly started. Every attempt got `code 8` back from the car, `"Request failed. Please check the vehicle status and try again."`, while lock, seat heat, and rear defrost all succeeded fine in the same sessions. There's no switch or config option for this, it's not exposed. The low-level request is still in `src/saic-client.js` (`controlWindow`/`WINDOW_ID`) in case a firmware update or a different vehicle behaves differently; if you try it and it works for you, an issue or PR is very welcome.
 
+### Window ventilation (MG S6 EV)
+
+`enableWindowVentilation`, off by default. A different request from the MG4 one above: all four door windows at once, no terminator (see `docs/API.md`). The request format is confirmed on a real MG S6 EV (Europe, left-hand drive) by a full-open command sent directly to the API; the two actions this switch actually sends, **ventilate** (on) and **close** (off), are not yet confirmed.
+
+Do this with the car in sight and dry weather. Turn the switch on and check every door window drops a few centimetres (not all the way); the next poll should still show the switch On. Turn it off and check all four close fully. Then open one window by hand: the switch should read On after the next poll, and turning it off should close it.
+
 ### Lock-triggered rapid refresh — confirming it's running
 
 New in 0.9.10, and low-risk to check because it doesn't send any command to the car, it only changes how often the plugin polls the charging endpoint. With debug logging on, lock the car (fob, iSmart app, or HomeKit) while the charger isn't already known to be plugged in, and watch the logs:
@@ -256,5 +262,6 @@ This was observed for roughly 45 minutes straight, across several Homebridge res
 - Front window defrost (`enableFrontDefrost`, off by default) is new in 0.9.9 and not yet confirmed against real hardware at all — see section 5.
 - Heated steering wheel (`enableHeatedSteeringWheel`, off by default) is ported from the reference client for the MG S6 EV and not yet confirmed against real hardware by this plugin — see section 5.
 - The newer iSmart apps' "pre-drive" feature is not implemented and not reverse-engineered anywhere; it would need a fresh traffic capture.
-- Window open/close doesn't work, see section 5 above. Not a config option, not a bug to chase further unless you're on different hardware/firmware.
+- Window open/close doesn't work on an MG4, see section 5 above. Not a config option, not a bug to chase further unless you're on different hardware/firmware.
+- Window ventilation (`enableWindowVentilation`, MG S6 EV format): request format confirmed on an S6 with a full open; ventilate and close not yet confirmed — see section 5.
 - Only tested against a single vehicle. If your account has more than one, set the `vin` config option to pin a specific one explicitly rather than relying on "first vehicle returned."

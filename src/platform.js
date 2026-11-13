@@ -36,6 +36,8 @@ export class MgSaicPlatform {
     // was written (unlike lock/unlock). See TESTING.md before turning them on. There is no
     // equivalent enableWindowControls option: window open/close was tried and confirmed not
     // to work on a real MG4, see README.md and CHANGELOG.md, so it was removed entirely.
+    // enableWindowVentilation below is a different request, the MG S6 EV's all-four-windows
+    // form (controlDoorWindows).
     this.enableHeatedSeats = config.enableHeatedSeats ?? false;
     this.enableRearDefrost = config.enableRearDefrost ?? false;
     this.enableFrontDefrost = config.enableFrontDefrost ?? false;
@@ -44,6 +46,7 @@ export class MgSaicPlatform {
     // Off by default and unconfirmed on any real car: lets the Cabin Cool tile send the
     // reference client's start_ac (no compressor flag) instead of being refused.
     this.enableExperimentalCabinCool = config.enableExperimentalCabinCool ?? false;
+    this.enableWindowVentilation = config.enableWindowVentilation ?? false;
     this.configuredVin = config.vin;
 
     this.client = new SaicClient(this.region, { log: this.log });
@@ -143,6 +146,7 @@ export class MgSaicPlatform {
       enableHeatedSteeringWheel: this.enableHeatedSteeringWheel,
       enableExperimentalCabinCool: this.enableExperimentalCabinCool,
       climateRange: this.climateRange,
+      enableWindowVentilation: this.enableWindowVentilation,
     });
 
     // The accessory constructor above adds or reuses services according to the current

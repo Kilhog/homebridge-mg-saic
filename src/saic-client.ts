@@ -537,7 +537,10 @@ export class SaicClient {
   // in case a firmware update or a different vehicle ever behaves differently; if you're
   // resurrecting this, WINDOW_ID.DRIVER is the one confirmed-correct mapping (both the reference
   // client and this project's own /vehicle/status capture call it "driver"), WINDOW_2/3/4 were
-  // never confirmed since the base command never worked.
+  // never confirmed since the base command never worked. (The reference client has since
+  // named them PASSENGER, REAR_LEFT and REAR_RIGHT, following the status field names.)
+  //
+  // The MG S6 EV uses a different form of the same rvcReqType "3": see controlDoorWindows below.
 
   controlWindow(vin: string, windowId: number, { open }: { open: boolean }): Promise<unknown> {
     const allWindowIds = [WINDOW_ID.SUNROOF, WINDOW_ID.DRIVER, WINDOW_ID.WINDOW_2, WINDOW_ID.WINDOW_3, WINDOW_ID.WINDOW_4];
@@ -545,10 +548,44 @@ export class SaicClient {
     rvcParams.push({ paramId: 13, paramValue: b64([open ? 3 : 0]) });
     return this.vehicleControl(vin, { rvcReqType: '3', rvcParams });
   }
+
+  /**
+   * All four door windows at once, in the MG S6 EV's format. Ported from
+   * saic_ismart_client_ng.api.vehicle.windows' control_door_windows / DoorWindowsAction, which
+   * the reference client took from decrypted MG S6 EV iSmart traffic: rvcReqType "3", the
+   * sunroof (paramId 8) = 0 i.e. left alone, all four door windows (paramId 9, 10, 11, 12) = 1,
+   * then the action in paramId 13 - DOOR_WINDOWS_ACTION.CLOSE (0), VENTILATE (1, open a few
+   * centimetres) or OPEN (2, fully open; controlWindow above sends 3 instead). Unlike almost
+   * every other command there is NO paramId 255 terminator. Per the reference client the S6
+   * doesn't accept single-window control this way, and reports ventilated and fully open
+   * windows the same way in its status, so the two can't be told apart afterwards.
+   *
+   * The full-open form (paramId 13 = 2) is confirmed on a real MG S6 EV (Europe, left-hand
+   * drive, 13 Nov 2026): accepted in about 10 s with failureType 0, and all four window fields
+   * read 1 afterwards. Close (0) and ventilate (1) are not yet confirmed by this plugin.
+   */
+  controlDoorWindows(vin: string, action: number): Promise<unknown> {
+    if (!(Object.values(DOOR_WINDOWS_ACTION) as number[]).includes(action)) {
+      return Promise.reject(new RangeError(`Door windows action must be 0 (close), 1 (ventilate) or 2 (open), got ${action}`));
+    }
+    return this.vehicleControl(vin, {
+      rvcReqType: '3',
+      rvcParams: [
+        { paramId: 8,  paramValue: b64([0]) },
+        { paramId: 9,  paramValue: b64([1]) },
+        { paramId: 10, paramValue: b64([1]) },
+        { paramId: 11, paramValue: b64([1]) },
+        { paramId: 12, paramValue: b64([1]) },
+        { paramId: 13, paramValue: b64([action]) },
+      ],
+    });
+  }
 }
 
 export const LOCK_ID: Record<string, number>   = { TAILGATE: 2, DOORS: 3 };
 export const WINDOW_ID: Record<string, number> = { SUNROOF: 8, DRIVER: 9, WINDOW_2: 10, WINDOW_3: 11, WINDOW_4: 12 };
+/** paramId 13 values for controlDoorWindows (the reference client's DoorWindowsAction). */
+export const DOOR_WINDOWS_ACTION = { CLOSE: 0, VENTILATE: 1, OPEN: 2 } as const;
 
 function b64(bytes: number[]): string {
   return Buffer.from(bytes).toString('base64');

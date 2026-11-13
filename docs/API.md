@@ -345,6 +345,32 @@ Param 8 = sunroof, 9 = driver's window, both unambiguous per the reference clien
 
 **Tried against a real MG4 (software version SWi165 - R11, Australia) and confirmed not to work.** The request is byte-identical to the reference client's, but every attempt got `code: 8` back, `"Request failed. Please check the vehicle status and try again.(255)"`, whether the car was locked, unlocked with the driver's door held open, or freshly started (all three tried). Other `/vehicle/control` commands (lock, seat heat, rear defrost) succeed fine in the same session, so this looks like either a genuine restriction on this vehicle/software version for remote window movement, or a precondition this project hasn't found. `controlWindow`/`WINDOW_ID` are still in `src/saic-client.js` for reference but nothing in the HomeKit accessory calls them. If you get this working on a different car or firmware version, an issue or PR would be very welcome.
 
+### Door windows, MG S6 EV format (`rvcReqType: "3"`, no terminator)
+
+The MG S6 EV uses a different form of the same request type: all four door windows at once, plus an action. Ported from `saic-python-client-ng`'s `control_door_windows` and `DoorWindowsAction` (`api/vehicle/windows`), which the reference client took from decrypted MG S6 EV iSmart traffic:
+
+```json
+{
+  "rvcReqType": "3",
+  "rvcParams": [
+    { "paramId": 8,  "paramValue": "AA==" },
+    { "paramId": 9,  "paramValue": "AQ==" },
+    { "paramId": 10, "paramValue": "AQ==" },
+    { "paramId": 11, "paramValue": "AQ==" },
+    { "paramId": 12, "paramValue": "AQ==" },
+    { "paramId": 13, "paramValue": "<AA== close, AQ== ventilate, Ag== fully open>" }
+  ],
+  "vin": "<sha256 hex of VIN>"
+}
+```
+
+- Param 8 (sunroof) is `0`, i.e. left alone; params 9–12 (driver, passenger, rear left, rear right, following the status field names) are all `1`.
+- Param 13 is the action: `0` close, `1` ventilate (a few centimetres), `2` fully open. The MG4-era request above sends `3` for open instead.
+- There is **no** param 255 terminator, unlike almost every other command.
+- Per the reference client the S6 doesn't accept single-window control this way, and reports a ventilated window and a fully open one the same way (`driverWindow` etc. non-zero), so the two can't be told apart afterwards.
+
+**Confirmed on a real MG S6 EV** (Europe, left-hand drive, 13 November 2026) for the full-open form: accepted in about 10 seconds (`rvcReqSts` `0x02`, `failureType` 0), and `driverWindow`, `passengerWindow`, `rearLeftWindow` and `rearRightWindow` all read `1` in the control response and on the next status read. Close (`0`) and ventilate (`1`) are not yet confirmed. This plugin's Window ventilation switch (`enableWindowVentilation`) only ever sends ventilate (on) and close (off).
+
 ## Rate limiting
 
 Poll conservatively. The Home Assistant integration deliberately throttles to avoid SAIC locking the account, and community reports mention the gateway pausing activity for 900 seconds when it detects a login from another device. A 15 minute poll interval is a sane default, with a manual refresh action for on-demand updates.
@@ -369,7 +395,7 @@ Field names as returned by the API, decoded meaning based on a live capture:
 | `rmtHtdRrWndSt` | `0` = off, drives the rear defrost Switch (off by default, confirmed working) |
 | `steeringHeatLevel` | `0` = off, non-zero = on. Drives the heated steering wheel Switch (off by default, not yet confirmed) |
 | `steeringWheelHeatFailureReason` | Undocumented. `0` presumably means no failure; a non-zero value is logged as-is |
-| `driverWindow`, `passengerWindow`, `rearLeftWindow`, `rearRightWindow` | `0` = closed. Readable, but there's no writable Switch for these, see "Windows" above |
+| `driverWindow`, `passengerWindow`, `rearLeftWindow`, `rearRightWindow` | `0` = closed, non-zero = open (ventilated or fully open, indistinguishable). Drive the Window ventilation Switch (off by default, MG S6 EV format, see above); no per-window Switch |
 
 ### `chrgMgmtData` (from `/vehicle/charging/mgmtData`)
 

@@ -113,6 +113,12 @@
         "type": "boolean",
         "default": false,
         "description": "On/off Switch for cars with a heated steering wheel (e.g. MG S6 EV), ported from the reference client. The car switches it off by itself after about 10 minutes. Not yet confirmed against real hardware by this plugin. Off by default, see TESTING.md."
+      },
+      "enableWindowVentilation": {
+        "title": "Expose a window ventilation switch (MG S6 EV format)",
+        "type": "boolean",
+        "default": false,
+        "description": "One Switch for all four door windows, using the MG S6 EV's window command: on opens them a few centimetres, off closes them. Fully opening is not exposed. Reads on when any door window is open, including one opened by hand. The command format is confirmed on a real MG S6 EV (full open); the ventilate and close actions are not yet. Does not work on the MG4 (see README.md). Off by default."
       }
     }
   }

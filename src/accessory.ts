@@ -86,13 +86,22 @@
  * remoteClimateStatus is logged on every change while the option is on, to find
  * out how a given car actually reports it.
  *
- * Window open/close was tried and confirmed NOT to work: the car
+ * Window open/close was tried and confirmed NOT to work on an MG4: the car
  * consistently rejects the command with "Request failed. Please check the
  * vehicle status and try again." regardless of lock state, door-open state,
  * or being freshly started. There's no HomeKit switch for it. The
  * low-level request is still in saic-client.ts (controlWindow/WINDOW_ID)
  * in case a future firmware update or a different vehicle behaves
  * differently, but nothing in this accessory calls it. See CHANGELOG.md.
+ *
+ * Window ventilation (enableWindowVentilation, off by default) is a different request:
+ * the MG S6 EV's all-four-door-windows form of the same rvcReqType "3"
+ * (controlDoorWindows in saic-client.ts). One Switch: On = ventilate (open every door
+ * window a few centimetres), Off = close all four. Fully opening them is deliberately not
+ * exposed. The car reports ventilated and fully open windows the same way, so the
+ * switch reads On whenever any of driverWindow/passengerWindow/rearLeftWindow/
+ * rearRightWindow is non-zero - including a window opened by hand - and turning it Off
+ * then closes all four.
  *
  * Heated steering wheel (enableHeatedSteeringWheel, off by default, not yet confirmed
  * against real hardware) is a plain Switch ported from the reference client's
@@ -110,7 +119,7 @@
  */
 
 import type { API, PlatformAccessory, Service, Characteristic, CharacteristicValue } from 'homebridge';
-import { SaicClient, SaicError } from './saic-client.js';
+import { SaicClient, SaicError, DOOR_WINDOWS_ACTION } from './saic-client.js';
 
 // Door field→service-index mapping, used in both setupContactSensors and pushStatusCharacteristics.
 const DOOR_FIELDS: [string, string][] = [
@@ -121,6 +130,9 @@ const DOOR_FIELDS: [string, string][] = [
   ['Boot',             'bootStatus'],
   ['Bonnet',           'bonnetStatus'],
 ];
+
+// The four door window status fields, the ones the window ventilation switch reads.
+const WINDOW_FIELDS = ['driverWindow', 'passengerWindow', 'rearLeftWindow', 'rearRightWindow'] as const;
 
 export interface AccessoryOpts {
   vin: string;
@@ -133,6 +145,7 @@ export interface AccessoryOpts {
   enableRearDefrost: boolean;
   enableFrontDefrost: boolean;
   enableHeatedSteeringWheel: boolean;
+  enableWindowVentilation: boolean;
   enableExperimentalCabinCool?: boolean;
   // Slider range for Cabin Heat / Cabin Cool, see climateTemperatureRange. Defaults to the
   // unknown-series range (17-33 °C) when not given.
@@ -231,6 +244,7 @@ export class MgSaicAccessory {
   private enableHeatedSteeringWheel: boolean;
   private enableExperimentalCabinCool: boolean;
   readonly climateRange: ClimateTemperatureRange;
+  private enableWindowVentilation: boolean;
 
   private batteryService!: Service;
   private lockService!: Service;
@@ -245,6 +259,7 @@ export class MgSaicAccessory {
   private rearDefrostService?: Service;
   private frontDefrostService?: Service;
   private steeringWheelHeatService?: Service;
+  private windowVentilationService?: Service;
 
   private _lastStatus:  StatusData   | null = null;
   private _lastCharging: ChargingData | null = null;
@@ -294,6 +309,7 @@ export class MgSaicAccessory {
   constructor(accessory: PlatformAccessory, client: SaicClient, {
     vin, log, api, enablePreconditioning, enableDoorSensors, enableTemperatureSensors,
     enableHeatedSeats, enableRearDefrost, enableFrontDefrost, enableHeatedSteeringWheel,
+    enableWindowVentilation,
     enableExperimentalCabinCool = false,
     climateRange = climateTemperatureRange(),
   }: AccessoryOpts) {
@@ -312,6 +328,7 @@ export class MgSaicAccessory {
     this.enableRearDefrost        = enableRearDefrost;
     this.enableFrontDefrost       = enableFrontDefrost;
     this.enableHeatedSteeringWheel = enableHeatedSteeringWheel;
+    this.enableWindowVentilation  = enableWindowVentilation;
     this.enableExperimentalCabinCool = enableExperimentalCabinCool;
     this.climateRange = { min: climateRange.min, max: climateRange.max };
     this._heatTargetTemp = this.clampClimateTemp(this._heatTargetTemp);
@@ -328,6 +345,7 @@ export class MgSaicAccessory {
     if (this.enableRearDefrost)        this.setupRearDefrostSwitch();
     if (this.enableFrontDefrost)       this.setupFrontDefrostSwitch();
     if (this.enableHeatedSteeringWheel) this.setupSteeringWheelHeatSwitch();
+    if (this.enableWindowVentilation)  this.setupWindowVentilationSwitch();
     this.logExposedServices();
   }
 
@@ -351,6 +369,7 @@ export class MgSaicAccessory {
     record(this.enableRearDefrost,        'Rear defrost');
     record(this.enableFrontDefrost,       'Front defrost');
     record(this.enableHeatedSteeringWheel, 'Heated steering wheel');
+    record(this.enableWindowVentilation,  'Window ventilation');
 
     this.log.info(`HomeKit services exposed: ${exposed.join(', ')}.`);
     if (disabled.length) {
@@ -545,6 +564,14 @@ export class MgSaicAccessory {
       .onSet((value) => this.setSteeringWheelHeat(value as boolean));
   }
 
+  setupWindowVentilationSwitch(): void {
+    this.windowVentilationService = this.accessory.getService('Window ventilation')
+      ?? this.accessory.addService(this.Service.Switch, 'Window ventilation', 'windowVentilation');
+    this.windowVentilationService.getCharacteristic(this.Characteristic.On)
+      .onGet(() => this.readWindowsOpen())
+      .onSet((value) => this.setWindowVentilation(value as boolean));
+  }
+
   // ------------------------------------------------------------- data reads
 
   private basicStatus(): BasicStatus | undefined {
@@ -665,6 +692,15 @@ export class MgSaicAccessory {
       this.log.warn(`The car reported steeringWheelHeatFailureReason=${reason} for the heated steering wheel (meaning undocumented).`);
     }
     this._lastSteeringWheelHeatFailureReason = reason;
+  }
+
+  /**
+   * true when any door window reads open (non-zero). The car reports a ventilated window and a
+   * fully open one the same way, so this can't tell them apart.
+   */
+  readWindowsOpen(): boolean {
+    const status = this.basicStatus();
+    return WINDOW_FIELDS.some((field) => Boolean(status?.[field]));
   }
 
   // --------------------------------------------------------------- lock write
@@ -951,6 +987,30 @@ export class MgSaicAccessory {
     }
   }
 
+  /**
+   * Handles the "Window ventilation" switch: On sends controlDoorWindows with VENTILATE (all
+   * four door windows open a few centimetres), Off sends CLOSE (all four closed). Same
+   * optimistic pattern as the seat heat switches: on success the four window fields are
+   * patched locally (1 or 0) and the next poll replaces them with what the car reports.
+   */
+  async setWindowVentilation(value: boolean): Promise<void> {
+    this.log.info(`${value ? 'Ventilating (opening a few cm)' : 'Closing'} all door windows via HomeKit...`);
+    try {
+      await this.client.controlDoorWindows(
+        this.vin, value ? DOOR_WINDOWS_ACTION.VENTILATE : DOOR_WINDOWS_ACTION.CLOSE,
+      );
+      const patch = Object.fromEntries(WINDOW_FIELDS.map((field) => [field, value ? 1 : 0]));
+      this._lastStatus = {
+        ...this._lastStatus,
+        basicVehicleStatus: { ...this.basicStatus(), ...patch },
+      };
+      this.log.info('Window ventilation command succeeded.');
+    } catch (err) {
+      this.log.warn(`Window ventilation command failed: ${(err as Error).message}`);
+      throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
+  }
+
   // ---------------------------------------------------------------- polling
 
   /** Called by the platform on its poll interval. Pushes fresh values into HomeKit. */
@@ -1121,6 +1181,9 @@ export class MgSaicAccessory {
     }
     if (this.enableHeatedSteeringWheel && this.steeringWheelHeatService) {
       this.steeringWheelHeatService.updateCharacteristic(this.Characteristic.On, this.readSteeringWheelHeat());
+    }
+    if (this.enableWindowVentilation && this.windowVentilationService) {
+      this.windowVentilationService.updateCharacteristic(this.Characteristic.On, this.readWindowsOpen());
     }
   }
 
