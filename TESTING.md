@@ -183,7 +183,7 @@ To test: turn it on, confirm the front windscreen actually demists/warms within 
 Since 0.9.7, pre-conditioning is exposed as **two separate HeaterCooler tiles** — Cabin Heat and Cabin Cool — instead of one tile with a mode-switch icon. Each has:
 
 - **Active** on/off — sends `startClimate` (with that tile's compressor flag) or `stopClimate`
-- **Temperature slider** — 17 °C to 33 °C, 1 °C step. Sliding while active re-sends the command immediately. The SAIC temperature index formula is `idx = 3 + (°C − 17)`
+- **Temperature slider** — 1 °C step, 17 °C to 33 °C on an MG4 (the range follows the vehicle series, see README.md). Sliding while active re-sends the command immediately. The SAIC temperature index formula is `idx = 3 + (°C − 17)`, i.e. `°C − 14`
 
 Turning one tile's Active on immediately shows the other as off in the Home app (the car only has one underlying climate system, so they can't both be running).
 
@@ -211,6 +211,10 @@ What's left isn't resolvable by comparing code: either a firmware/market differe
 </details>
 
 **This is not the "pre-drive" feature** in the newer iSmart phone apps. That's something else, and it has not been reverse-engineered by this project, the reference client, or the Home Assistant integration. Implementing it would need a fresh traffic capture from a current app.
+
+**Slider range on a non-MG4 car.** Check the startup log line `Climate target temperature range: …` matches your car's series. On a car that isn't an MG4, the range comes from `saic-python-mqtt-gateway` and hasn't been checked against the iSmart app: compare the slider's ends with the app's own temperature range, and try Cabin Heat at the minimum and maximum once to confirm the car accepts both. If not, set `climateMinTemperature` / `climateMaxTemperature`.
+
+**Experimental Cabin Cool (`enableExperimentalCabinCool`, off by default, not confirmed on any car).** This sends the reference client's `start_ac` — no param 22, i.e. byte for byte the Cabin Heat command — with the Cool tile's own target temperature, on the theory that the car decides heat vs cool from the target. To test it: pick a warm day (cabin clearly above the target), set the Cool slider well below the cabin temperature (e.g. 18 °C), lock the car, turn Cabin Cool on, and stay near the car. Check three things: whether cold air actually comes out, what the iSmart app shows, and the `Car reports remoteClimateStatus=<n>` lines in the Homebridge log (logged on every change while the option is on; `2` = plain "on" per the MQTT gateway, `3` = cooling per `mg-saic-ha`). If it heats instead, turn it off and leave the option off. Then try the reverse on the Heat tile (target well above the cabin temperature) to confirm Heat still heats.
 
 Still untested: the **stop** path on either tile. Tap Active off and confirm the car actually stops, and that `remoteClimateStatus` returns to `0`.
 
@@ -247,7 +251,8 @@ This was observed for roughly 45 minutes straight, across several Homebridge res
 
 ## Known gaps at this stage
 
-- Pre-conditioning is now two separate HeaterCooler tiles, Cabin Heat and Cabin Cool (17–33 °C slider each), rather than one tile with a mode toggle. Cabin Cool's Active toggle is disabled — confirmed on real hardware to heat at maximum instead of cooling, see section 5. The **stop** path is still unexercised on either tile — see section 5.
+- Pre-conditioning is now two separate HeaterCooler tiles, Cabin Heat and Cabin Cool (one slider each, 17–33 °C on an MG4, range per vehicle series otherwise), rather than one tile with a mode toggle. Cabin Cool's Active toggle is disabled — confirmed on real hardware to heat at maximum instead of cooling, see section 5. The **stop** path is still unexercised on either tile — see section 5.
+- The experimental Cabin Cool mode (`enableExperimentalCabinCool`, off by default) is a hypothesis from the reference client's `start_ac`, not confirmed on any car — see section 5.
 - Front window defrost (`enableFrontDefrost`, off by default) is new in 0.9.9 and not yet confirmed against real hardware at all — see section 5.
 - Heated steering wheel (`enableHeatedSteeringWheel`, off by default) is ported from the reference client for the MG S6 EV and not yet confirmed against real hardware by this plugin — see section 5.
 - The newer iSmart apps' "pre-drive" feature is not implemented and not reverse-engineered anywhere; it would need a fresh traffic capture.

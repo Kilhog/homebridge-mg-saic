@@ -17,7 +17,7 @@ Exposes one MG EV as one HomeKit accessory with:
 - **Battery** — state of charge, charging state, low battery warning
 - **LockMechanism** — central locking, lock and unlock, writable
 - **ContactSensor** × 6 — driver door, passenger door, rear left door, rear right door, boot, bonnet
-- **HeaterCooler** × 2 — cabin pre-conditioning, i.e. remote climate / aircon, as separate **Cabin Heat** and **Cabin Cool** tiles rather than one tile with a mode toggle. Each has its own 17 °C to 33 °C (1 °C step) target temperature slider. Heat is confirmed working since 0.9.4; Cool's Active toggle is disabled since it's confirmed to heat the cabin instead of cooling it. See below for details
+- **HeaterCooler** × 2 — cabin pre-conditioning, i.e. remote climate / aircon, as separate **Cabin Heat** and **Cabin Cool** tiles rather than one tile with a mode toggle. Each has its own target temperature slider (1 °C step): 17 °C to 33 °C on an MG4, otherwise chosen from the vehicle series (see below). Heat is confirmed working since 0.9.4; Cool's Active toggle is disabled since it's confirmed to heat the cabin instead of cooling it. See below for details
 - **Outlet** — charging cable plugged in (`On`) and actively drawing (`InUse`)
 - **TemperatureSensor** × 2 — interior and exterior temperature. Falls back to the last known good reading and flags `StatusFault` if the API returns an unavailable-field sentinel instead of a real value
 - **Switch** × 2 — heated seats, left and right (off by default, see below)
@@ -35,9 +35,13 @@ Since the car has only one underlying climate system, the two tiles are mutually
 
 **Cabin Heat** — PTC resistive heater, no compressor:
 - **Active** — turns it on/off
-- **Temperature slider** — 17 °C to 33 °C, 1 °C step. Sliding while active re-sends the command immediately so the car adjusts without toggling off and back on. The chosen temperature persists across on/off cycles for the session
+- **Temperature slider** — 1 °C step, range from the vehicle series (below). Sliding while active re-sends the command immediately so the car adjusts without toggling off and back on. The chosen temperature persists across on/off cycles for the session
 
-**Cabin Cool** — added in 0.9.7 sending param ID 22 = 1 (AC compressor on) as the same command as Cabin Heat. **Confirmed NOT to work**: tested against a real MG4 via HomeKit, it ran the heater at maximum instead of cooling, both by the iSmart app's own display and by feel. Turning the tile's Active on now fails immediately instead of repeating that command; turning it off still works. See `TESTING.md`/`docs/API.md` for what's been ruled out so far. If you can capture a real cooling command's raw request (from the iSmart app or from `mg-saic-ha`), an issue or PR is very welcome.
+**Slider range by vehicle series.** The temperature index sent to the car is always `°C − 14` (the same formula in `mg-saic-ha`'s MG4 profile and in `saic-python-mqtt-gateway` for every series), but the range a car accepts differs. The range is picked from the `series` code returned by `/vehicle/list`, the way `saic-python-mqtt-gateway` does: MG4 (`EH32…`) keeps 17–33 °C (the gateway caps it at 31 °C, this plugin keeps its long-standing 33 so nothing changes for MG4 owners), MG S5 (`MZS3E…`) gets 16–31 °C, and any other series gets the gateway's default 16–28 °C. The MG S6 EV (series `MIS3E…`) lands on 16–28 °C; its real range isn't confirmed anywhere. If the series can't be read at startup, it stays at 17–33 °C. The startup log prints the range in use, and `climateMinTemperature` / `climateMaxTemperature` (whole numbers, 16–33 °C) override it.
+
+**Cabin Cool** — added in 0.9.7 sending param ID 22 = 1 (AC compressor on) as the same command as Cabin Heat. **Confirmed NOT to work**: tested against a real MG4 via HomeKit, it ran the heater at maximum instead of cooling, both by the iSmart app's own display and by feel. Turning the tile's Active on now fails immediately instead of repeating that command; turning it off still works, and moving its slider no longer sends anything to the car. See `TESTING.md`/`docs/API.md` for what's been ruled out so far. If you can capture a real cooling command's raw request (from the iSmart app or from `mg-saic-ha`), an issue or PR is very welcome.
+
+**Experimental Cabin Cool (`enableExperimentalCabinCool`, off by default, NOT confirmed on any real car).** The reference client's own `start_ac` never sends param 22 at all: it sends fan speed 2 and a target temperature index, and leaves it to the car to heat or cool towards that target (of its convenience commands, only front defrost sends 22 = 1). With this option on, turning Cabin Cool on sends exactly that — byte for byte the Cabin Heat command, with the Cool tile's own target temperature — on the hypothesis that the car cools when the target is below the cabin temperature. Cabin Heat's own behaviour doesn't change. Because the car may report this as `remoteClimateStatus` 2 (what `saic-python-mqtt-gateway` decodes as plain "on") rather than 3, the plugin remembers it was the Cool tile that asked and keeps showing Cool, not Heat, until the climate stops or another climate command is sent (this memory doesn't survive a Homebridge restart). While the option is on, every change in the raw `remoteClimateStatus` is logged, which is the quickest way to see what the car actually did. Stay near the car the first time you try it.
 
 Each tile shows a plain on/off mode in the Home app (no mode-switch icon, unlike a single combined tile) — that's deliberate, so each side is independently addressable by Siri ("turn on Cabin Heat") and by HomeKit Automations (e.g. a scheduled switch for a cold morning vs. a hot afternoon).
 
@@ -93,6 +97,8 @@ Via Homebridge Config UI X (the plugin ships a `config.schema.json`, which drive
 ```
 
 Leave `password` out of `config.json` and instead set the `MG_SAIC_PASSWORD` environment variable for the Homebridge process, so the password isn't sitting in plain text on disk. If you do set `password` in config, be aware `config.json` is unencrypted.
+
+Optional `climateMinTemperature` / `climateMaxTemperature` fields override the Cabin Heat / Cabin Cool slider range, which otherwise follows the vehicle series (see above).
 
 Optional `vin` field pins the plugin to a specific vehicle if the account ever returns more than one; otherwise it uses the first vehicle the account returns.
 

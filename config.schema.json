@@ -57,7 +57,27 @@
         "title": "Expose cabin pre-conditioning (aircon) as Cabin Heat / Cabin Cool HeaterCoolers",
         "type": "boolean",
         "default": true,
-        "description": "The remote aircon / climate control, exposed as two separate HeaterCooler tiles: 'Cabin Heat' (PTC resistive heater, confirmed working on a real MG4) and 'Cabin Cool' (AC compressor, added in 0.9.7, not yet confirmed against real hardware). Each has its own target temperature slider, 17 °C to 33 °C. Turning one on automatically shows the other as off, since the car only has one underlying climate system. It is also not the pre-drive feature in the newer iSmart apps. See TESTING.md. With this off you get no tile in the Home app at all."
+        "description": "The remote aircon / climate control, exposed as two separate HeaterCooler tiles: 'Cabin Heat' (confirmed working on a real MG4) and 'Cabin Cool' (turning it on is refused unless the experimental option below is set: the compressor command was confirmed to heat at maximum on a real MG4). Each has its own target temperature slider, 17 °C to 33 °C on an MG4 (the range follows the vehicle series, see below). Turning one on automatically shows the other as off, since the car only has one underlying climate system. It is also not the pre-drive feature in the newer iSmart apps. See TESTING.md. With this off you get no tile in the Home app at all."
+      },
+      "climateMinTemperature": {
+        "title": "Cabin Heat / Cabin Cool slider minimum (°C, optional)",
+        "type": "integer",
+        "minimum": 16,
+        "maximum": 33,
+        "description": "Leave blank to pick the range from the vehicle's series code, like saic-python-mqtt-gateway: MG4 (EH32) 17-33 °C, MG S5 (MZS3E) 16-31 °C, any other series 16-28 °C (the MG S6 EV lands here; its real range isn't confirmed), 17-33 °C if the series is unknown. Startup log shows the range in use."
+      },
+      "climateMaxTemperature": {
+        "title": "Cabin Heat / Cabin Cool slider maximum (°C, optional)",
+        "type": "integer",
+        "minimum": 16,
+        "maximum": 33,
+        "description": "Leave blank to pick it from the vehicle's series code (see the minimum above). Must be above the minimum."
+      },
+      "enableExperimentalCabinCool": {
+        "title": "Experimental: let Cabin Cool start the climate without the compressor flag",
+        "type": "boolean",
+        "default": false,
+        "description": "NOT confirmed on any real car. When on, turning Cabin Cool on sends the reference client's start_ac (fan 2 and the Cool tile's target temperature, no compressor flag), i.e. the same command as Cabin Heat, and relies on the car to cool towards a target below the cabin temperature. The raw remoteClimateStatus is logged on every change so you can see what the car actually did. Stay near the car the first time. See README.md."
       },
       "enableDoorSensors": {
         "title": "Expose door / boot / bonnet contact sensors",

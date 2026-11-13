@@ -1,5 +1,5 @@
 import { SaicClient, SaicError } from './saic-client.js';
-import { MgSaicAccessory } from './accessory.js';
+import { MgSaicAccessory, climateTemperatureRange } from './accessory.js';
 
 const PLUGIN_NAME = 'homebridge-mg-saic';
 const PLATFORM_NAME = 'MgSaic';
@@ -41,6 +41,9 @@ export class MgSaicPlatform {
     this.enableFrontDefrost = config.enableFrontDefrost ?? false;
     // MG S6 EV control ported from the reference client, not yet confirmed by this plugin.
     this.enableHeatedSteeringWheel = config.enableHeatedSteeringWheel ?? false;
+    // Off by default and unconfirmed on any real car: lets the Cabin Cool tile send the
+    // reference client's start_ac (no compressor flag) instead of being refused.
+    this.enableExperimentalCabinCool = config.enableExperimentalCabinCool ?? false;
     this.configuredVin = config.vin;
 
     this.client = new SaicClient(this.region, { log: this.log });
@@ -96,6 +99,22 @@ export class MgSaicPlatform {
       this.log.info(`Vehicle series: ${matchedVehicle.series}${name ? ` (${name})` : ''}`);
     }
 
+    // The same series code also picks the Cabin Heat / Cabin Cool slider range, the way
+    // saic-python-mqtt-gateway does (see climateTemperatureRange), unless config overrides it.
+    // (null, which a cleared form field can leave behind, counts as not set.)
+    const minOverride = this.config.climateMinTemperature ?? undefined;
+    const maxOverride = this.config.climateMaxTemperature ?? undefined;
+    const range = climateTemperatureRange(matchedVehicle?.series, { min: minOverride, max: maxOverride });
+    if (range.error) this.log.warn(range.error);
+    this.climateRange = { min: range.min, max: range.max };
+    if (this.enablePreconditioning) {
+      const overridden = !range.error && (minOverride !== undefined || maxOverride !== undefined);
+      const source = overridden ? 'from config'
+        : matchedVehicle?.series ? `for series ${matchedVehicle.series}`
+          : 'default, vehicle series unknown';
+      this.log.info(`Climate target temperature range: ${range.min}-${range.max} °C (${source}).`);
+    }
+
     this.registerAccessory(vin);
     this.startPolling();
   }
@@ -122,6 +141,8 @@ export class MgSaicPlatform {
       enableRearDefrost: this.enableRearDefrost,
       enableFrontDefrost: this.enableFrontDefrost,
       enableHeatedSteeringWheel: this.enableHeatedSteeringWheel,
+      enableExperimentalCabinCool: this.enableExperimentalCabinCool,
+      climateRange: this.climateRange,
     });
 
     // The accessory constructor above adds or reuses services according to the current

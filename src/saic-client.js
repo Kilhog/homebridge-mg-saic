@@ -430,6 +430,8 @@ export class SaicClient {
   // compressor=true: AC compressor engaged for cooling, remoteClimateStatus expected to return
   //   3 (COOLING). Confirmed NOT to work as documented: a real MG4 test ran the heater at
   //   maximum instead of cooling. See the plugin's TESTING.md/docs/API.md before touching this.
+  //   No caller in this plugin sends it any more; the reference client's start_ac never sends
+  //   param 22 at all, which the experimental Cabin Cool mode relies on (compressor=false).
 
   startClimate(vin, temperatureIdx = 8, compressor = false) {
     const params = [

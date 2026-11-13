@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { MgSaicAccessory } from '../src/accessory.js';
+import { MgSaicAccessory, climateTemperatureRange, climateTemperatureIndex } from '../src/accessory.js';
 
 // ---------------------------------------------------------------------------
 // Minimal stub for api.hap so we can construct MgSaicAccessory without
@@ -78,12 +78,15 @@ function makeAccessory(overrides = {}) {
   const platformAccessory = {
     getService: (name) => serviceCache[name] ?? null,
     addService: (type, name) => {
+      // One shared characteristic stub per service, so a test can inspect what was set on it
+      // (e.g. setProps ranges) through service.getCharacteristic().
+      const characteristic = {
+        onGet: vi.fn().mockReturnThis(),
+        onSet: vi.fn().mockReturnThis(),
+        setProps: vi.fn().mockReturnThis(),
+      };
       const svc = {
-        getCharacteristic: () => ({
-          onGet: vi.fn().mockReturnThis(),
-          onSet: vi.fn().mockReturnThis(),
-          setProps: vi.fn().mockReturnThis(),
-        }),
+        getCharacteristic: () => characteristic,
         updateCharacteristic: vi.fn(),
         setCharacteristic: vi.fn().mockReturnThis(),
       };
@@ -123,6 +126,7 @@ function makeAccessory(overrides = {}) {
     enableRearDefrost: true,
     enableFrontDefrost: true,
     enableHeatedSteeringWheel: true,
+    enableExperimentalCabinCool: false,
     ...overrides,
   });
 
@@ -408,6 +412,92 @@ describe('setCoolActive', () => {
   });
 });
 
+describe('setCoolActive - experimental (enableExperimentalCabinCool)', () => {
+  it('sends start_ac (no compressor flag) with the Cool tile target temperature', async () => {
+    const { acc, client } = makeAccessory({ enableExperimentalCabinCool: true });
+    client.startClimate.mockResolvedValue({});
+    acc._coolTargetTemp = 18;
+    await acc.setCoolActive(true);
+    // 18 °C → idx = 3 + (18 - 17) = 4; compressor=false, same bytes as Cabin Heat
+    expect(client.startClimate).toHaveBeenCalledWith('TESTVIN123', 4, false);
+    expect(acc.readCoolActive()).toBe(true);
+    expect(acc.readHeatActive()).toBe(false);
+  });
+
+  it('mirrors Active=INACTIVE onto Heat and clears front defrost when turning on', async () => {
+    const { acc, client } = makeAccessory({ enableExperimentalCabinCool: true });
+    client.startFrontDefrost.mockResolvedValue({});
+    await acc.setFrontDefrost(true);
+    client.startClimate.mockResolvedValue({});
+    await acc.setCoolActive(true);
+    expect(acc.heatService.updateCharacteristic).toHaveBeenCalledWith(acc.Characteristic.Active, INACTIVE);
+    expect(acc._frontDefrostActive).toBe(false);
+  });
+
+  it('keeps showing Cool (not Heat) when the car reports remoteClimateStatus 2 after a Cool start', async () => {
+    const { acc, client } = makeAccessory({ enableExperimentalCabinCool: true });
+    client.startClimate.mockResolvedValue({});
+    await acc.setCoolActive(true);
+    client.vehicleStatus.mockResolvedValue({ basicVehicleStatus: { remoteClimateStatus: 2 } });
+    client.chargingStatus.mockResolvedValue({ chrgMgmtData: {} });
+    await acc.refresh();
+    expect(acc.readCoolActive()).toBe(true);
+    expect(acc.readHeatActive()).toBe(false);
+  });
+
+  it('forgets the Cool origin once the car reports the climate off', async () => {
+    const { acc, client } = makeAccessory({ enableExperimentalCabinCool: true });
+    client.startClimate.mockResolvedValue({});
+    await acc.setCoolActive(true);
+    client.chargingStatus.mockResolvedValue({ chrgMgmtData: {} });
+    client.vehicleStatus.mockResolvedValueOnce({ basicVehicleStatus: { remoteClimateStatus: 0 } });
+    await acc.refresh();
+    client.vehicleStatus.mockResolvedValueOnce({ basicVehicleStatus: { remoteClimateStatus: 2 } });
+    await acc.refresh();
+    expect(acc.readHeatActive()).toBe(true);
+    expect(acc.readCoolActive()).toBe(false);
+  });
+
+  it('hands the climate back to Heat when Cabin Heat is turned on afterwards', async () => {
+    const { acc, client } = makeAccessory({ enableExperimentalCabinCool: true });
+    client.startClimate.mockResolvedValue({});
+    await acc.setCoolActive(true);
+    await acc.setHeatActive(true);
+    expect(acc.readHeatActive()).toBe(true);
+    expect(acc.readCoolActive()).toBe(false);
+  });
+
+  it('throws a HapStatusError and leaves state unchanged when the command fails', async () => {
+    const { acc, client } = makeAccessory({ enableExperimentalCabinCool: true });
+    client.startClimate.mockRejectedValue(new Error('timeout'));
+    await expect(acc.setCoolActive(true)).rejects.toThrow('HapStatusError');
+    expect(acc.readCoolActive()).toBe(false);
+  });
+
+  it('logs the raw remoteClimateStatus whenever it changes, and only then', async () => {
+    const { acc, client, log } = makeAccessory({ enableExperimentalCabinCool: true });
+    client.chargingStatus.mockResolvedValue({ chrgMgmtData: {} });
+    client.vehicleStatus.mockResolvedValue({ basicVehicleStatus: { remoteClimateStatus: 3 } });
+    await acc.refresh();
+    await acc.refresh();
+    const logged = log.info.mock.calls.filter(([m]) => m.includes('remoteClimateStatus=3'));
+    expect(logged).toHaveLength(1);
+  });
+
+  it('does not log remoteClimateStatus when the experimental option is off', async () => {
+    const { acc, client, log } = makeAccessory();
+    client.chargingStatus.mockResolvedValue({ chrgMgmtData: {} });
+    client.vehicleStatus.mockResolvedValue({ basicVehicleStatus: { remoteClimateStatus: 3 } });
+    await acc.refresh();
+    expect(log.info).not.toHaveBeenCalledWith(expect.stringContaining('remoteClimateStatus='));
+  });
+
+  it('warns at startup that the experimental mode is on', () => {
+    const { log } = makeAccessory({ enableExperimentalCabinCool: true });
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Experimental Cabin Cool is on'));
+  });
+});
+
 describe('setFrontDefrost', () => {
   it('calls startFrontDefrost and reflects the new state when turning on', async () => {
     const { acc, client } = makeAccessory();
@@ -591,20 +681,107 @@ describe('setCoolTemperature', () => {
     expect(client.startClimate).not.toHaveBeenCalled();
   });
 
-  it('re-sends startClimate with compressor=true when the Cool tile is on', async () => {
+  it('never re-sends the compressor command while Cabin Cool is disabled, even if the car is cooling', async () => {
+    // Real bug this guards against: the slider used to re-send param 22 = 1, the command
+    // confirmed to heat at maximum on a real MG4, whenever remoteClimateStatus read 3.
     const { acc, client } = makeAccessory();
+    acc._lastStatus = { basicVehicleStatus: { remoteClimateStatus: 3 } };
+    await acc.setCoolTemperature(24);
+    expect(client.startClimate).not.toHaveBeenCalled();
+    expect(acc._coolTargetTemp).toBe(24);
+  });
+
+  it('re-sends startClimate WITHOUT the compressor flag when experimental Cool is on and active', async () => {
+    const { acc, client } = makeAccessory({ enableExperimentalCabinCool: true });
     acc._lastStatus = { basicVehicleStatus: { remoteClimateStatus: 3 } };
     client.startClimate.mockResolvedValue({});
     await acc.setCoolTemperature(24);
     // 24 °C → idx = 3 + (24 - 17) = 10
-    expect(client.startClimate).toHaveBeenCalledWith('TESTVIN123', 10, true);
+    expect(client.startClimate).toHaveBeenCalledWith('TESTVIN123', 10, false);
   });
 
   it('throws a HapStatusError when the re-send fails', async () => {
-    const { acc, client } = makeAccessory();
+    const { acc, client } = makeAccessory({ enableExperimentalCabinCool: true });
     acc._lastStatus = { basicVehicleStatus: { remoteClimateStatus: 3 } };
     client.startClimate.mockRejectedValue(new Error('timeout'));
     await expect(acc.setCoolTemperature(24)).rejects.toThrow('HapStatusError');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// climate temperature range and index
+// ---------------------------------------------------------------------------
+
+describe('climateTemperatureRange', () => {
+  it('keeps 17-33 °C for the MG4 (EH32) and for an unknown series', () => {
+    expect(climateTemperatureRange('EH32 S')).toEqual({ min: 17, max: 33 });
+    expect(climateTemperatureRange(undefined)).toEqual({ min: 17, max: 33 });
+    expect(climateTemperatureRange('  ')).toEqual({ min: 17, max: 33 });
+  });
+
+  it('uses the MQTT gateway ranges for other series', () => {
+    expect(climateTemperatureRange('MZS3E')).toEqual({ min: 16, max: 31 });
+    // MG S6 EV: series "MIS3E S" is neither EH32 nor MZS3E -> the gateway default
+    expect(climateTemperatureRange('MIS3E S')).toEqual({ min: 16, max: 28 });
+    expect(climateTemperatureRange('mis3e s')).toEqual({ min: 16, max: 28 });
+  });
+
+  it('applies valid config overrides, either bound on its own', () => {
+    expect(climateTemperatureRange('MIS3E S', { min: 17, max: 30 })).toEqual({ min: 17, max: 30 });
+    expect(climateTemperatureRange('MIS3E S', { max: 30 })).toEqual({ min: 16, max: 30 });
+    expect(climateTemperatureRange('EH32 S', { min: 18 })).toEqual({ min: 18, max: 33 });
+  });
+
+  it('ignores invalid overrides, keeps the series range and says why', () => {
+    for (const overrides of [{ min: 15 }, { max: 34 }, { min: 20.5 }, { min: '18' }, { min: 25, max: 20 }, { min: 20, max: 20 }]) {
+      const range = climateTemperatureRange('MIS3E S', overrides);
+      expect(range).toMatchObject({ min: 16, max: 28 });
+      expect(range.error).toMatch(/Ignoring climateMinTemperature/);
+    }
+  });
+});
+
+describe('climateTemperatureIndex', () => {
+  it('is °C - 14, the same formula as mg-saic-ha (MG4) and the MQTT gateway (all series)', () => {
+    expect(climateTemperatureIndex(16)).toBe(2);
+    expect(climateTemperatureIndex(17)).toBe(3);
+    expect(climateTemperatureIndex(22)).toBe(8);
+    expect(climateTemperatureIndex(28)).toBe(14);
+    expect(climateTemperatureIndex(33)).toBe(19);
+  });
+});
+
+describe('climate range on the accessory', () => {
+  it('defaults to 17-33 °C when no range is given (unchanged MG4 behaviour)', () => {
+    const { acc } = makeAccessory();
+    expect(acc.climateRange).toEqual({ min: 17, max: 33 });
+    expect(acc.heatService.getCharacteristic().setProps)
+      .toHaveBeenCalledWith({ minValue: 17, maxValue: 33, minStep: 1 });
+  });
+
+  it('sets both sliders to the given range', () => {
+    const { acc } = makeAccessory({ climateRange: { min: 16, max: 28 } });
+    expect(acc.heatService.getCharacteristic().setProps)
+      .toHaveBeenCalledWith({ minValue: 16, maxValue: 28, minStep: 1 });
+    expect(acc.coolService.getCharacteristic().setProps)
+      .toHaveBeenCalledWith({ minValue: 16, maxValue: 28, minStep: 1 });
+  });
+
+  it('clamps a target outside the range and sends the clamped index', async () => {
+    const { acc, client } = makeAccessory({ climateRange: { min: 16, max: 28 } });
+    acc._lastStatus = { basicVehicleStatus: { remoteClimateStatus: 2 } };
+    client.startClimate.mockResolvedValue({});
+    await acc.setHeatTemperature(31);
+    expect(acc._heatTargetTemp).toBe(28);
+    expect(client.startClimate).toHaveBeenCalledWith('TESTVIN123', 14, false);
+  });
+
+  it('sends index 2 for 16 °C, the bottom of the non-MG4 range', async () => {
+    const { acc, client } = makeAccessory({ climateRange: { min: 16, max: 28 } });
+    client.startClimate.mockResolvedValue({});
+    acc._heatTargetTemp = 16;
+    await acc.setHeatActive(true);
+    expect(client.startClimate).toHaveBeenCalledWith('TESTVIN123', 2, false);
   });
 });
 
