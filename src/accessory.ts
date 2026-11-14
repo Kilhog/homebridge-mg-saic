@@ -162,6 +162,8 @@ import {
   DOOR_WINDOWS_ACTION, HEATED_SEAT, REAR_HEATED_SEAT_ON_LEVEL, TAILGATE_ACTION,
 } from './saic-client.js';
 import { OutageLog } from './outage.js';
+import { CommandQueue, commandDelayMs } from './command-queue.js';
+import type { Control } from './command-queue.js';
 
 // Door status fields, one contact sensor each; the field is also the service subtype.
 // Used in setupContactSensors, statusFieldsInUse and pushStatusCharacteristics.
@@ -217,6 +219,13 @@ export function serviceLanguage(value: unknown): ServiceLanguage {
 // The four door window status fields, the ones the window ventilation switch reads.
 const WINDOW_FIELDS = ['driverWindow', 'passengerWindow', 'rearLeftWindow', 'rearRightWindow'] as const;
 
+/** Switch tiles backed by a single command each (the front seats share one, see frontSeatsControl). */
+export type SwitchKey =
+  'steeringWheelHeat' | 'windowVentilation' | 'rearDefrost' | 'frontDefrost' | 'rearLeftSeatHeat' | 'rearRightSeatHeat';
+export interface FrontSeats { left: boolean; right: boolean }
+/** What the climate tiles ask for: which one is on, at what target (°C). */
+export interface ClimateState { mode: 'heat' | 'cool' | 'off'; temp?: number }
+
 export interface AccessoryOpts {
   vin: string;
   /** Model name the account reports (e.g. "MGS6 EV"); "MG4" when unknown. */
@@ -247,6 +256,9 @@ export interface AccessoryOpts {
   useStatusCache?: boolean;
   // Language of the tile names, see SERVICE_NAMES. English by default.
   language?: ServiceLanguage;
+  // Seconds a Home app change waits for the next one before it's sent (0-10, default 2).
+  // See command-queue.ts.
+  commandDelaySeconds?: unknown;
 }
 
 // ------------------------------------------------------- climate temperature
@@ -432,6 +444,11 @@ export class MgSaicAccessory {
   private _coolStartedLocally = false;
   // Last remoteClimateStatus seen, so it's only logged when it changes.
   private _lastRemoteClimateStatus?: number;
+  // Every Home app write goes through this: debounced, single-flight per control.
+  private readonly commands: CommandQueue;
+  readonly commandDelayMs: number;
+  // Target of the last climate start this plugin sent; undefined once stopped.
+  private _climateSentTemp?: number;
 
   constructor(accessory: PlatformAccessory, client: SaicClient, {
     vin, model, log, api, enablePreconditioning, enableDoorSensors, enableTemperatureSensors,
@@ -445,6 +462,7 @@ export class MgSaicAccessory {
     staleAfterMs = DEFAULT_STALE_AFTER_MS,
     useStatusCache = false,
     language = 'en',
+    commandDelaySeconds,
   }: AccessoryOpts) {
     this.accessory   = accessory;
     this.client      = client;
@@ -474,6 +492,8 @@ export class MgSaicAccessory {
     this.chargingOutage           = new OutageLog(log, 'Charging status');
     this.useStatusCache           = useStatusCache;
     this.language                 = serviceLanguage(language);
+    this.commandDelayMs           = commandDelayMs(commandDelaySeconds, log);
+    this.commands                 = new CommandQueue(this.commandDelayMs, log);
 
     // A command whose outcome is unknown was not re-sent; find out what the car actually did.
     // Any command also means the next status read is the full one (useStatusCache).
@@ -574,6 +594,7 @@ export class MgSaicAccessory {
     record(this.enablePowerTailgate,      'Power tailgate');
 
     this.log.info(`HomeKit services exposed: ${exposed.join(', ')}.`);
+    this.log.info(`Home app changes are sent to the car ${this.commandDelayMs / 1000} s after the last one (commandDelaySeconds).`);
     if (disabled.length) {
       this.log.info(`Not exposed, disabled in config: ${disabled.join(', ')}.`);
     }
@@ -625,10 +646,8 @@ export class MgSaicAccessory {
       .onGet(() => this.readLockState());
 
     this.lockService.getCharacteristic(this.Characteristic.LockTargetState)
-      .onGet(() => (this.readLockState() === this.Characteristic.LockCurrentState.SECURED
-        ? this.Characteristic.LockTargetState.SECURED
-        : this.Characteristic.LockTargetState.UNSECURED))
-      .onSet((value) => this.setLockTarget(value as CharacteristicValue));
+      .onGet(() => this.shownLockTarget())
+      .onSet((value) => this.requestLock(value));
   }
 
   setupOutletService(): void {
@@ -648,10 +667,10 @@ export class MgSaicAccessory {
     this.heatService = this.useService(this.Service.HeaterCooler, 'preconditionHeat', 'preconditionHeat');
 
     this.heatService.getCharacteristic(this.Characteristic.Active)
-      .onGet(() => (this.readHeatActive()
+      .onGet(() => (this.shownClimateMode() === 'heat'
         ? this.Characteristic.Active.ACTIVE
         : this.Characteristic.Active.INACTIVE))
-      .onSet((value) => this.setHeatActive(value === this.Characteristic.Active.ACTIVE));
+      .onSet((value) => this.requestClimate('heat', { active: value === this.Characteristic.Active.ACTIVE }));
 
     this.heatService.getCharacteristic(this.Characteristic.CurrentHeaterCoolerState)
       .onGet(() => (this.readHeatActive()
@@ -671,7 +690,7 @@ export class MgSaicAccessory {
     this.heatService.getCharacteristic(this.Characteristic.HeatingThresholdTemperature)
       .setProps({ minValue: this.climateRange.min, maxValue: this.climateRange.max, minStep: 1 })
       .onGet(() => this._heatTargetTemp)
-      .onSet((value) => this.setHeatTemperature(value as number));
+      .onSet((value) => this.requestClimate('heat', { temp: Number(value) }));
 
     // "Cabin Cool" — locked to TargetHeaterCoolerState.COOL. Only exposed with
     // enableExperimentalCabinCool: without it the tile could never be turned on (see
@@ -680,10 +699,10 @@ export class MgSaicAccessory {
     this.coolService = this.useService(this.Service.HeaterCooler, 'preconditionCool', 'preconditionCool');
 
     this.coolService.getCharacteristic(this.Characteristic.Active)
-      .onGet(() => (this.readCoolActive()
+      .onGet(() => (this.shownClimateMode() === 'cool'
         ? this.Characteristic.Active.ACTIVE
         : this.Characteristic.Active.INACTIVE))
-      .onSet((value) => this.setCoolActive(value === this.Characteristic.Active.ACTIVE));
+      .onSet((value) => this.requestClimate('cool', { active: value === this.Characteristic.Active.ACTIVE }));
 
     this.coolService.getCharacteristic(this.Characteristic.CurrentHeaterCoolerState)
       .onGet(() => (this.readCoolActive()
@@ -702,7 +721,7 @@ export class MgSaicAccessory {
     this.coolService.getCharacteristic(this.Characteristic.CoolingThresholdTemperature)
       .setProps({ minValue: this.climateRange.min, maxValue: this.climateRange.max, minStep: 1 })
       .onGet(() => this._coolTargetTemp)
-      .onSet((value) => this.setCoolTemperature(value as number));
+      .onSet((value) => this.requestClimate('cool', { temp: Number(value) }));
   }
 
   setupContactSensors(): void {
@@ -735,53 +754,53 @@ export class MgSaicAccessory {
   setupHeatedSeatSwitches(): void {
     this.leftSeatHeatService = this.useService(this.Service.Switch, 'leftSeatHeat', 'leftSeatHeat');
     this.leftSeatHeatService.getCharacteristic(this.Characteristic.On)
-      .onGet(() => this.readSeatHeat('frontLeftSeatHeatLevel'))
-      .onSet((value) => this.setSeatHeat('left', value as boolean));
+      .onGet(() => this.shownFrontSeats().left)
+      .onSet((value) => this.requestFrontSeatHeat('left', Boolean(value)));
 
     this.rightSeatHeatService = this.useService(this.Service.Switch, 'rightSeatHeat', 'rightSeatHeat');
     this.rightSeatHeatService.getCharacteristic(this.Characteristic.On)
-      .onGet(() => this.readSeatHeat('frontRightSeatHeatLevel'))
-      .onSet((value) => this.setSeatHeat('right', value as boolean));
+      .onGet(() => this.shownFrontSeats().right)
+      .onSet((value) => this.requestFrontSeatHeat('right', Boolean(value)));
   }
 
   setupRearDefrostSwitch(): void {
     this.rearDefrostService = this.useService(this.Service.Switch, 'rearDefrost', 'rearDefrost');
     this.rearDefrostService.getCharacteristic(this.Characteristic.On)
-      .onGet(() => Boolean(this.basicStatus()?.['rmtHtdRrWndSt']))
-      .onSet((value) => this.setRearDefrost(value as boolean));
+      .onGet(() => this.shownSwitch('rearDefrost'))
+      .onSet((value) => this.requestSwitch('rearDefrost', Boolean(value)));
   }
 
   setupFrontDefrostSwitch(): void {
     this.frontDefrostService = this.useService(this.Service.Switch, 'frontDefrost', 'frontDefrost');
     this.frontDefrostService.getCharacteristic(this.Characteristic.On)
-      .onGet(() => this._frontDefrostActive)
-      .onSet((value) => this.setFrontDefrost(value as boolean));
+      .onGet(() => this.shownSwitch('frontDefrost'))
+      .onSet((value) => this.requestSwitch('frontDefrost', Boolean(value)));
   }
 
   setupSteeringWheelHeatSwitch(): void {
     this.steeringWheelHeatService = this.useService(this.Service.Switch, 'steeringWheelHeat', 'steeringWheelHeat');
     this.steeringWheelHeatService.getCharacteristic(this.Characteristic.On)
-      .onGet(() => this.readSteeringWheelHeat())
-      .onSet((value) => this.setSteeringWheelHeat(value as boolean));
+      .onGet(() => this.shownSwitch('steeringWheelHeat'))
+      .onSet((value) => this.requestSwitch('steeringWheelHeat', Boolean(value)));
   }
 
   setupWindowVentilationSwitch(): void {
     this.windowVentilationService = this.useService(this.Service.Switch, 'windowVentilation', 'windowVentilation');
     this.windowVentilationService.getCharacteristic(this.Characteristic.On)
-      .onGet(() => this.readWindowsOpen())
-      .onSet((value) => this.setWindowVentilation(value as boolean));
+      .onGet(() => this.shownSwitch('windowVentilation'))
+      .onSet((value) => this.requestSwitch('windowVentilation', Boolean(value)));
   }
 
   setupRearSeatHeatSwitches(): void {
     this.rearLeftSeatHeatService = this.useService(this.Service.Switch, 'rearLeftSeatHeat', 'rearLeftSeatHeat');
     this.rearLeftSeatHeatService.getCharacteristic(this.Characteristic.On)
-      .onGet(() => this.readSeatHeat('secondRowLeftSeatHeatLevel'))
-      .onSet((value) => this.setRearSeatHeat('left', value as boolean));
+      .onGet(() => this.shownSwitch('rearLeftSeatHeat'))
+      .onSet((value) => this.requestSwitch('rearLeftSeatHeat', Boolean(value)));
 
     this.rearRightSeatHeatService = this.useService(this.Service.Switch, 'rearRightSeatHeat', 'rearRightSeatHeat');
     this.rearRightSeatHeatService.getCharacteristic(this.Characteristic.On)
-      .onGet(() => this.readSeatHeat('secondRowRightSeatHeatLevel'))
-      .onSet((value) => this.setRearSeatHeat('right', value as boolean));
+      .onGet(() => this.shownSwitch('rearRightSeatHeat'))
+      .onSet((value) => this.requestSwitch('rearRightSeatHeat', Boolean(value)));
   }
 
   setupTailgateOpener(): void {
@@ -789,8 +808,8 @@ export class MgSaicAccessory {
     this.tailgateService.getCharacteristic(this.Characteristic.CurrentDoorState)
       .onGet(() => this.readTailgateCurrentState());
     this.tailgateService.getCharacteristic(this.Characteristic.TargetDoorState)
-      .onGet(() => this.readTailgateTargetState())
-      .onSet((value) => this.setTailgateTarget(value === this.Characteristic.TargetDoorState.OPEN));
+      .onGet(() => this.shownTailgateTarget())
+      .onSet((value) => this.requestTailgate(value === this.Characteristic.TargetDoorState.OPEN));
     // Required by GarageDoorOpener; the car reports nothing like it.
     this.tailgateService.getCharacteristic(this.Characteristic.ObstructionDetected)
       .onGet(() => false);
@@ -906,6 +925,10 @@ export class MgSaicAccessory {
       : this.Characteristic.StatusFault.NO_FAULT;
   }
 
+  readRearDefrost(): boolean {
+    return Boolean(this.basicStatus()?.['rmtHtdRrWndSt']);
+  }
+
   readSeatHeat(field: string): boolean {
     return Boolean(this.basicStatus()?.[field]);
   }
@@ -965,6 +988,206 @@ export class MgSaicAccessory {
     throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.READ_ONLY_CHARACTERISTIC);
   }
 
+  // ------------------------------------------------------- debounced commands
+  //
+  // Every write from the Home app goes through the command queue (command-queue.ts): it's
+  // answered at once, and the car gets the latest value once nothing more has been asked
+  // for commandDelaySeconds - nothing at all for a burst that ends where it started. The
+  // set* methods below are what the queue finally calls; they're unchanged.
+
+  /** What a tile shows: the value waiting or on its way to the car, else the car's state. */
+  private shown<T>(key: string, read: () => T): T {
+    const pending = this.commands.pending<T>(key);
+    return pending ? pending.value : read();
+  }
+
+  /** A Switch tile backed by a single command. */
+  private switchControl(key: SwitchKey): Control<boolean> {
+    const specs: Record<SwitchKey, [string, () => Service | undefined, () => boolean, (on: boolean) => Promise<void>]> = {
+      steeringWheelHeat: ['Heated steering wheel', () => this.steeringWheelHeatService,
+        () => this.readSteeringWheelHeat(), (on) => this.setSteeringWheelHeat(on)],
+      windowVentilation: ['Window ventilation', () => this.windowVentilationService,
+        () => this.readWindowsOpen(), (on) => this.setWindowVentilation(on)],
+      rearDefrost: ['Rear window defrost', () => this.rearDefrostService,
+        () => this.readRearDefrost(), (on) => this.setRearDefrost(on)],
+      frontDefrost: ['Front window defrost', () => this.frontDefrostService,
+        () => this._frontDefrostActive, (on) => this.setFrontDefrost(on)],
+      rearLeftSeatHeat: ['Rear left seat heat', () => this.rearLeftSeatHeatService,
+        () => this.readSeatHeat('secondRowLeftSeatHeatLevel'), (on) => this.setRearSeatHeat('left', on)],
+      rearRightSeatHeat: ['Rear right seat heat', () => this.rearRightSeatHeatService,
+        () => this.readSeatHeat('secondRowRightSeatHeatLevel'), (on) => this.setRearSeatHeat('right', on)],
+    };
+    const [label, service, read, send] = specs[key];
+    return {
+      label,
+      current: read,
+      send,
+      refresh: () => service()?.updateCharacteristic(this.Characteristic.On, this.shownSwitch(key)),
+    };
+  }
+
+  /** On as a Switch tile shows it. */
+  shownSwitch(key: SwitchKey): boolean {
+    return this.shown(key, this.switchControl(key).current as () => boolean);
+  }
+
+  /** A Home app write on a Switch tile. */
+  requestSwitch(key: SwitchKey, on: boolean): void {
+    this.commands.request(key, this.switchControl(key), on);
+  }
+
+  /** Both front seats share one request, so their two tiles share one queued command. */
+  private frontSeatsControl(): Control<FrontSeats> {
+    const read = (): FrontSeats => ({
+      left: this.readSeatHeat('frontLeftSeatHeatLevel'),
+      right: this.readSeatHeat('frontRightSeatHeatLevel'),
+    });
+    return {
+      label: 'Front seat heat',
+      current: read,
+      send: ({ left, right }) => this.setFrontSeatHeat(left, right),
+      refresh: () => {
+        const shown = this.shownFrontSeats();
+        this.leftSeatHeatService?.updateCharacteristic(this.Characteristic.On, shown.left);
+        this.rightSeatHeatService?.updateCharacteristic(this.Characteristic.On, shown.right);
+      },
+    };
+  }
+
+  shownFrontSeats(): FrontSeats {
+    return this.shown('frontSeats', this.frontSeatsControl().current as () => FrontSeats);
+  }
+
+  requestFrontSeatHeat(side: 'left' | 'right', on: boolean): void {
+    const shown = this.shownFrontSeats();
+    this.commands.request('frontSeats', this.frontSeatsControl(), {
+      left: side === 'left' ? on : shown.left,
+      right: side === 'right' ? on : shown.right,
+    });
+  }
+
+  private lockControl(): Control<boolean> {
+    const { LockCurrentState, LockTargetState } = this.Characteristic;
+    return {
+      label: 'Lock',
+      current: () => this.readLockState() === LockCurrentState.SECURED,
+      send: (locked) => this.setLockTarget(locked ? LockTargetState.SECURED : LockTargetState.UNSECURED),
+      refresh: () => this.lockService.updateCharacteristic(LockTargetState, this.shownLockTarget()),
+    };
+  }
+
+  /** LockTargetState as the tile shows it; LockCurrentState always stays the car's. */
+  shownLockTarget(): CharacteristicValue {
+    const { LockCurrentState, LockTargetState } = this.Characteristic;
+    const locked = this.shown('lock', () => this.readLockState() === LockCurrentState.SECURED);
+    return locked ? LockTargetState.SECURED : LockTargetState.UNSECURED;
+  }
+
+  requestLock(value: CharacteristicValue): void {
+    this.commands.request('lock', this.lockControl(), value === this.Characteristic.LockTargetState.SECURED);
+  }
+
+  private tailgateControl(): Control<boolean> {
+    return {
+      label: 'Tailgate',
+      current: () => Boolean(this.basicStatus()?.['bootStatus']),
+      send: (open) => this.setTailgateTarget(open),
+      refresh: () => this.tailgateService?.updateCharacteristic(
+        this.Characteristic.TargetDoorState, this.shownTailgateTarget(),
+      ),
+    };
+  }
+
+  shownTailgateTarget(): CharacteristicValue {
+    const pending = this.commands.pending<boolean>('tailgate');
+    if (!pending) return this.readTailgateTargetState();
+    return pending.value ? this.Characteristic.TargetDoorState.OPEN : this.Characteristic.TargetDoorState.CLOSED;
+  }
+
+  requestTailgate(open: boolean): void {
+    this.commands.request('tailgate', this.tailgateControl(), open);
+  }
+
+  /**
+   * Cabin Heat and Cabin Cool drive the one climate system, so all their writes (Active and
+   * target temperature, on either tile) share one queued command: turning Heat on and moving
+   * its dial within the delay sends a single start at the final temperature.
+   */
+  private climateControl(): Control<ClimateState> {
+    return {
+      label: 'Cabin climate',
+      current: () => this.currentClimate(),
+      send: (want) => this.applyClimate(want),
+      refresh: () => this.pushClimateActive(),
+    };
+  }
+
+  /** The climate as the car reports it; temp is the last target this plugin sent, if any. */
+  private currentClimate(): ClimateState {
+    if (this.readHeatActive()) return { mode: 'heat', temp: this._climateSentTemp };
+    if (this.readCoolActive()) return { mode: 'cool', temp: this._climateSentTemp };
+    return { mode: 'off' };
+  }
+
+  /** Which climate tile shows as on: what's waiting or being sent, else the car. */
+  shownClimateMode(): ClimateState['mode'] {
+    return this.shown('climate', () => this.currentClimate()).mode;
+  }
+
+  private pushClimateActive(): void {
+    const { ACTIVE, INACTIVE } = this.Characteristic.Active;
+    const mode = this.shownClimateMode();
+    this.heatService?.updateCharacteristic(this.Characteristic.Active, mode === 'heat' ? ACTIVE : INACTIVE);
+    this.coolService?.updateCharacteristic(this.Characteristic.Active, mode === 'cool' ? ACTIVE : INACTIVE);
+  }
+
+  /**
+   * A Home app write on Cabin Heat or Cabin Cool: Active, or the tile's target temperature.
+   * A temperature is remembered at once (the dial reads it back) and only sent while that
+   * tile is, or is about to be, on - as before. Turning a tile off stops the climate unless
+   * the other tile is the one shown on.
+   */
+  requestClimate(tile: 'heat' | 'cool', change: { active?: boolean; temp?: number }): void {
+    const shownMode = this.shownClimateMode();
+    if (change.temp !== undefined) {
+      const temp = this.clampClimateTemp(change.temp);
+      if (tile === 'heat') this._heatTargetTemp = temp;
+      else this._coolTargetTemp = temp;
+      if (shownMode === tile) this.commands.request('climate', this.climateControl(), { mode: tile, temp });
+      return;
+    }
+    if (change.active) {
+      const temp = tile === 'heat' ? this._heatTargetTemp : this._coolTargetTemp;
+      this.commands.request('climate', this.climateControl(), { mode: tile, temp });
+    } else if (shownMode !== (tile === 'heat' ? 'cool' : 'heat')) {
+      this.commands.request('climate', this.climateControl(), { mode: 'off' });
+    }
+  }
+
+  /** Sends what the climate tiles ask for, with the existing heat / cool commands. */
+  private async applyClimate(want: ClimateState): Promise<void> {
+    if (want.mode === 'off') {
+      await (this.readCoolActive() ? this.setCoolActive(false) : this.setHeatActive(false));
+      this._climateSentTemp = undefined;
+      return;
+    }
+    const temp = want.temp ?? (want.mode === 'heat' ? this._heatTargetTemp : this._coolTargetTemp);
+    if (want.mode === 'heat') {
+      if (this.readHeatActive()) {
+        await this.setHeatTemperature(temp);
+      } else {
+        this._heatTargetTemp = temp;
+        await this.setHeatActive(true);
+      }
+    } else if (this.readCoolActive()) {
+      await this.setCoolTemperature(temp);
+    } else {
+      this._coolTargetTemp = temp;
+      await this.setCoolActive(true);
+    }
+    this._climateSentTemp = temp;
+  }
+
   // --------------------------------------------------------------- lock write
 
   /**
@@ -1016,11 +1239,14 @@ export class MgSaicAccessory {
    * "On" is frontSeatHeatLevel (default 3) for both, as it was always 3 before.
    */
   async setSeatHeat(side: 'left' | 'right', value: boolean): Promise<void> {
-    const on         = this.frontSeatHeatLevel;
-    const otherField = side === 'left' ? 'frontRightSeatHeatLevel' : 'frontLeftSeatHeatLevel';
-    const otherOn    = Boolean(this.basicStatus()?.[otherField]);
-    const leftLevel  = side === 'left'  ? (value ? on : 0) : (otherOn ? on : 0);
-    const rightLevel = side === 'right' ? (value ? on : 0) : (otherOn ? on : 0);
+    const otherOn = this.readSeatHeat(side === 'left' ? 'frontRightSeatHeatLevel' : 'frontLeftSeatHeatLevel');
+    return side === 'left' ? this.setFrontSeatHeat(value, otherOn) : this.setFrontSeatHeat(otherOn, value);
+  }
+
+  /** Both front seats in the one request the API has; "on" is frontSeatHeatLevel. */
+  async setFrontSeatHeat(left: boolean, right: boolean): Promise<void> {
+    const leftLevel  = left ? this.frontSeatHeatLevel : 0;
+    const rightLevel = right ? this.frontSeatHeatLevel : 0;
     this.log.info(`Setting seat heat via HomeKit: left=${leftLevel ? 'on' : 'off'} right=${rightLevel ? 'on' : 'off'}`);
 
     try {
@@ -1548,11 +1774,12 @@ export class MgSaicAccessory {
 
   pushStatusCharacteristics(): void {
     this.lockService.updateCharacteristic(this.Characteristic.LockCurrentState, this.readLockState());
+    this.lockService.updateCharacteristic(this.Characteristic.LockTargetState, this.shownLockTarget());
     const interiorTemp = this.readInteriorTempForClimate();
     if (this.enablePreconditioning && this.heatService) {
       this.heatService.updateCharacteristic(
         this.Characteristic.Active,
-        this.readHeatActive() ? this.Characteristic.Active.ACTIVE : this.Characteristic.Active.INACTIVE,
+        this.shownClimateMode() === 'heat' ? this.Characteristic.Active.ACTIVE : this.Characteristic.Active.INACTIVE,
       );
       this.heatService.updateCharacteristic(
         this.Characteristic.CurrentHeaterCoolerState,
@@ -1563,7 +1790,7 @@ export class MgSaicAccessory {
     if (this.enablePreconditioning && this.coolService) {
       this.coolService.updateCharacteristic(
         this.Characteristic.Active,
-        this.readCoolActive() ? this.Characteristic.Active.ACTIVE : this.Characteristic.Active.INACTIVE,
+        this.shownClimateMode() === 'cool' ? this.Characteristic.Active.ACTIVE : this.Characteristic.Active.INACTIVE,
       );
       this.coolService.updateCharacteristic(
         this.Characteristic.CurrentHeaterCoolerState,
@@ -1593,30 +1820,29 @@ export class MgSaicAccessory {
       );
     }
     if (this.enableHeatedSeats && this.leftSeatHeatService && this.rightSeatHeatService) {
-      this.leftSeatHeatService.updateCharacteristic(this.Characteristic.On, this.readSeatHeat('frontLeftSeatHeatLevel'));
-      this.rightSeatHeatService.updateCharacteristic(this.Characteristic.On, this.readSeatHeat('frontRightSeatHeatLevel'));
+      const seats = this.shownFrontSeats();
+      this.leftSeatHeatService.updateCharacteristic(this.Characteristic.On, seats.left);
+      this.rightSeatHeatService.updateCharacteristic(this.Characteristic.On, seats.right);
     }
     if (this.enableRearDefrost && this.rearDefrostService) {
-      this.rearDefrostService.updateCharacteristic(
-        this.Characteristic.On, Boolean(this.basicStatus()?.['rmtHtdRrWndSt']),
-      );
+      this.rearDefrostService.updateCharacteristic(this.Characteristic.On, this.shownSwitch('rearDefrost'));
     }
     if (this.enableFrontDefrost && this.frontDefrostService) {
-      this.frontDefrostService.updateCharacteristic(this.Characteristic.On, this._frontDefrostActive);
+      this.frontDefrostService.updateCharacteristic(this.Characteristic.On, this.shownSwitch('frontDefrost'));
     }
     if (this.enableHeatedSteeringWheel && this.steeringWheelHeatService) {
-      this.steeringWheelHeatService.updateCharacteristic(this.Characteristic.On, this.readSteeringWheelHeat());
+      this.steeringWheelHeatService.updateCharacteristic(this.Characteristic.On, this.shownSwitch('steeringWheelHeat'));
     }
     if (this.enableWindowVentilation && this.windowVentilationService) {
-      this.windowVentilationService.updateCharacteristic(this.Characteristic.On, this.readWindowsOpen());
+      this.windowVentilationService.updateCharacteristic(this.Characteristic.On, this.shownSwitch('windowVentilation'));
     }
     if (this.enableRearHeatedSeats && this.rearLeftSeatHeatService && this.rearRightSeatHeatService) {
-      this.rearLeftSeatHeatService.updateCharacteristic(this.Characteristic.On, this.readSeatHeat('secondRowLeftSeatHeatLevel'));
-      this.rearRightSeatHeatService.updateCharacteristic(this.Characteristic.On, this.readSeatHeat('secondRowRightSeatHeatLevel'));
+      this.rearLeftSeatHeatService.updateCharacteristic(this.Characteristic.On, this.shownSwitch('rearLeftSeatHeat'));
+      this.rearRightSeatHeatService.updateCharacteristic(this.Characteristic.On, this.shownSwitch('rearRightSeatHeat'));
     }
     if (this.enablePowerTailgate && this.tailgateService) {
       this.tailgateService.updateCharacteristic(this.Characteristic.CurrentDoorState, this.readTailgateCurrentState());
-      this.tailgateService.updateCharacteristic(this.Characteristic.TargetDoorState, this.readTailgateTargetState());
+      this.tailgateService.updateCharacteristic(this.Characteristic.TargetDoorState, this.shownTailgateTarget());
     }
   }
 

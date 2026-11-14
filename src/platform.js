@@ -189,6 +189,8 @@ export class MgSaicPlatform {
       useStatusCache: this.useStatusCache,
       // Tile names in the Home app: "fr" or English (default, also for anything else).
       language: serviceLanguage(this.config.language),
+      // Validated (0-10 s, default 2) by the accessory, which logs a warning if it's off.
+      commandDelaySeconds: this.config.commandDelaySeconds,
     });
 
     // The accessory constructor above adds or reuses services according to the current
