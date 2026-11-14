@@ -68,7 +68,7 @@ function makeHap() {
     HapStatusError: class HapStatusError extends Error {
       constructor(status) { super('HapStatusError'); this.hapStatus = status; }
     },
-    HAPStatus: { SERVICE_COMMUNICATION_FAILURE: -70402 },
+    HAPStatus: { SERVICE_COMMUNICATION_FAILURE: -70402, READ_ONLY_CHARACTERISTIC: -70404 },
   };
   return hap;
 }
@@ -1311,5 +1311,22 @@ describe('unused services', () => {
     acc._lastStatus = { basicVehicleStatus: { remoteClimateStatus: 2, interiorTemperature: 20 } };
     expect(() => acc.pushStatusCharacteristics()).not.toThrow();
     expect(acc.heatService.updateCharacteristic).toHaveBeenCalledWith(acc.Characteristic.Active, 1);
+  });
+});
+
+describe('charging outlet', () => {
+  it('refuses a tap and pushes the real plugged-in state back', async () => {
+    const { acc, log } = makeAccessory();
+    acc._lastCharging = { chrgMgmtData: { ccuOnbdChrgrPlugOn: 0 } };
+    const outlet = acc.accessory.getService('Outlet');
+    expect(outlet.getCharacteristic().onSet).toHaveBeenCalled();
+
+    let error;
+    try { acc.rejectChargingOutletWrite(); } catch (err) { error = err; }
+    expect(error?.hapStatus).toBe(-70404);
+    expect(log.info).toHaveBeenCalledWith(expect.stringContaining("can't start or stop charging"));
+
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(outlet.updateCharacteristic).toHaveBeenCalledWith(acc.Characteristic.On, false);
   });
 });
