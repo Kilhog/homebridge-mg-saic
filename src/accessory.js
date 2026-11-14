@@ -481,7 +481,8 @@ export class MgSaicAccessory {
     this.outletService = this.useService(this.Service.Outlet, 'chargingOutlet');
 
     this.outletService.getCharacteristic(this.Characteristic.On)
-      .onGet(() => this.readPluggedIn());
+      .onGet(() => this.readPluggedIn())
+      .onSet(() => this.rejectChargingOutletWrite());
 
     this.outletService.getCharacteristic(this.Characteristic.OutletInUse)
       .onGet(() => this.readCharging());
@@ -775,6 +776,18 @@ export class MgSaicAccessory {
     return this._lastStatus?.basicVehicleStatus?.bootStatus
       ? this.Characteristic.TargetDoorState.OPEN
       : this.Characteristic.TargetDoorState.CLOSED;
+  }
+
+  /**
+   * The charging outlet only reports: On = cable plugged in, OutletInUse = charging. There's
+   * no charging command behind it, so a tap in the Home app is refused (the tile used to flip
+   * with nothing sent to the car, until the next poll put it back), and the real value is
+   * pushed straight back.
+   */
+  rejectChargingOutletWrite() {
+    this.log.info('The charging cable tile only shows whether the cable is plugged in: it can\'t start or stop charging.');
+    setImmediate(() => this.outletService.updateCharacteristic(this.Characteristic.On, this.readPluggedIn()));
+    throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.READ_ONLY_CHARACTERISTIC);
   }
 
   // --------------------------------------------------------------- lock write

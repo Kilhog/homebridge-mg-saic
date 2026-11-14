@@ -18,7 +18,7 @@ Exposes one MG EV as one HomeKit accessory with:
 - **LockMechanism** — central locking, lock and unlock, writable
 - **ContactSensor** × 6 — driver door, passenger door, rear left door, rear right door, boot, bonnet
 - **HeaterCooler** — cabin pre-conditioning, i.e. remote climate / aircon, as a **Cabin Heat** tile, plus a separate **Cabin Cool** tile only with `enableExperimentalCabinCool` (the compressor command is confirmed to heat the cabin instead of cooling it, so without that option the Cool tile is not shown). Each has its own target temperature slider (1 °C step): 17 °C to 33 °C on an MG4, otherwise chosen from the vehicle series (see below). Heat is confirmed working since 0.9.4. See below for details
-- **Outlet** — charging cable plugged in (`On`) and actively drawing (`InUse`)
+- **Outlet** — charging cable plugged in (`On`) and actively drawing (`InUse`). Read-only: there's no charging command behind it, so a tap in the Home app is refused and the tile stays on the real state
 - **TemperatureSensor** × 2 — interior and exterior temperature. Falls back to the last known good reading and flags `StatusFault` if the API returns an unavailable-field sentinel instead of a real value
 - **Switch** × 2 — heated seats, left and right (off by default, see below)
 - **Switch** × 2 — rear heated seats, rear left and rear right (off by default, MG S6 EV control from the reference client, not yet confirmed against real hardware, see below)

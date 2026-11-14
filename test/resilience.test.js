@@ -61,7 +61,7 @@ function makeHapStub() {
     Characteristic, Service,
     uuid: { generate: (x) => x },
     HapStatusError: class HapStatusError extends Error { constructor(status) { super('HapStatusError'); this.hapStatus = status; } },
-    HAPStatus: { SERVICE_COMMUNICATION_FAILURE: -70402 },
+    HAPStatus: { SERVICE_COMMUNICATION_FAILURE: -70402, READ_ONLY_CHARACTERISTIC: -70404 },
   };
   return { hap, platformAccessory, services, Characteristic };
 }
