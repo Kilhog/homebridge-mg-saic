@@ -49,6 +49,14 @@
         ],
         "description": "Language of the names the tiles get in the Home app (Cabin Heat / Chauffage habitacle, Driver door / Porte conducteur...). A tile you renamed in the Home app keeps your name."
       },
+      "commandDelaySeconds": {
+        "title": "Delay before a Home app change is sent (seconds)",
+        "type": "number",
+        "default": 2,
+        "minimum": 0,
+        "maximum": 10,
+        "description": "A change in the Home app is answered at once and sent to the car only once nothing more has changed for this long, with the latest value: switching something on then off again within the delay sends nothing. A single change is always sent. 0 sends right away."
+      },
       "region": {
         "title": "Region",
         "type": "string",

@@ -1330,3 +1330,188 @@ describe('charging outlet', () => {
     expect(outlet.updateCharacteristic).toHaveBeenCalledWith(acc.Characteristic.On, false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Home app writes go through the command queue (2 s debounce, single flight)
+// ---------------------------------------------------------------------------
+
+describe('Home app writes', () => {
+  const settle = () => vi.advanceTimersByTimeAsync(0);
+
+  it('answers at once and sends the steering wheel command after 2 s', async () => {
+    vi.useFakeTimers();
+    try {
+      const { acc, client } = makeAccessory();
+      client.controlHeatedSteeringWheel.mockResolvedValue({});
+      acc.requestSwitch('steeringWheelHeat', true);
+      expect(acc.shownSwitch('steeringWheelHeat')).toBe(true);
+      expect(client.controlHeatedSteeringWheel).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(client.controlHeatedSteeringWheel).toHaveBeenCalledTimes(1);
+      expect(client.controlHeatedSteeringWheel).toHaveBeenCalledWith('TESTVIN123', true);
+      await settle();
+      expect(acc.readSteeringWheelHeat()).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('sends nothing when a switch is turned on then off within the delay', async () => {
+    vi.useFakeTimers();
+    try {
+      const { acc, client, log } = makeAccessory();
+      acc.requestSwitch('steeringWheelHeat', true);
+      await vi.advanceTimersByTimeAsync(1000);
+      acc.requestSwitch('steeringWheelHeat', false);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(client.controlHeatedSteeringWheel).not.toHaveBeenCalled();
+      expect(log.info).toHaveBeenCalledWith('Heated steering wheel: changed back within 2 s, nothing sent.');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('puts the tile back to the car state when the command fails', async () => {
+    vi.useFakeTimers();
+    try {
+      const { acc, client } = makeAccessory();
+      client.controlHeatedSteeringWheel.mockRejectedValue(new Error('timeout'));
+      acc.requestSwitch('steeringWheelHeat', true);
+      await vi.advanceTimersByTimeAsync(2000);
+      await settle();
+      expect(acc.shownSwitch('steeringWheelHeat')).toBe(false);
+      const wheel = acc.accessory.getServiceById('Switch', 'steeringWheelHeat');
+      expect(wheel.updateCharacteristic).toHaveBeenLastCalledWith(acc.Characteristic.On, false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('merges both front seats into one request', async () => {
+    vi.useFakeTimers();
+    try {
+      const { acc, client } = makeAccessory();
+      client.controlHeatedSeats.mockResolvedValue({});
+      acc.requestFrontSeatHeat('left', true);
+      acc.requestFrontSeatHeat('right', true);
+      expect(acc.shownFrontSeats()).toEqual({ left: true, right: true });
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(client.controlHeatedSeats).toHaveBeenCalledTimes(1);
+      expect(client.controlHeatedSeats).toHaveBeenCalledWith('TESTVIN123', { leftLevel: 3, rightLevel: 3 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('turns Cabin Heat on at the last dial position with a single start', async () => {
+    vi.useFakeTimers();
+    try {
+      const { acc, client } = makeAccessory();
+      client.startClimate.mockResolvedValue({});
+      acc.requestClimate('heat', { active: true });
+      acc.requestClimate('heat', { temp: 20 });
+      acc.requestClimate('heat', { temp: 24 });
+      expect(acc.shownClimateMode()).toBe('heat');
+      expect(acc._heatTargetTemp).toBe(24);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(client.startClimate).toHaveBeenCalledTimes(1);
+      expect(client.startClimate).toHaveBeenCalledWith('TESTVIN123', climateTemperatureIndex(24), false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('only remembers a dial change while Cabin Heat is off', async () => {
+    vi.useFakeTimers();
+    try {
+      const { acc, client } = makeAccessory();
+      acc.requestClimate('heat', { temp: 25 });
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(acc._heatTargetTemp).toBe(25);
+      expect(client.startClimate).not.toHaveBeenCalled();
+      expect(client.stopClimate).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops the climate when Cabin Heat is turned off', async () => {
+    vi.useFakeTimers();
+    try {
+      const { acc, client } = makeAccessory();
+      acc._lastStatus = { basicVehicleStatus: { remoteClimateStatus: 2 } };
+      client.stopClimate.mockResolvedValue({});
+      acc.requestClimate('heat', { active: false });
+      expect(acc.shownClimateMode()).toBe('off');
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(client.stopClimate).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shows the lock target at once and leaves the current state to the car', async () => {
+    vi.useFakeTimers();
+    try {
+      const { acc, client } = makeAccessory();
+      acc._lastStatus = { basicVehicleStatus: { lockStatus: 0 } };
+      client.lockVehicle.mockResolvedValue({});
+      acc.requestLock(SECURED);
+      expect(acc.shownLockTarget()).toBe(SECURED);
+      expect(acc.readLockState()).toBe(UNSECURED);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(client.lockVehicle).toHaveBeenCalledTimes(1);
+      await settle();
+      expect(acc.readLockState()).toBe(SECURED);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('sends nothing for an unlock undone within the delay', async () => {
+    vi.useFakeTimers();
+    try {
+      const { acc, client } = makeAccessory();
+      acc._lastStatus = { basicVehicleStatus: { lockStatus: 1 } };
+      acc.requestLock(UNSECURED);
+      acc.requestLock(SECURED);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(client.unlockVehicle).not.toHaveBeenCalled();
+      expect(client.lockVehicle).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps showing a pending change when a poll lands meanwhile', async () => {
+    vi.useFakeTimers();
+    try {
+      const { acc } = makeAccessory();
+      acc.requestSwitch('windowVentilation', true);
+      acc._lastStatus = { basicVehicleStatus: { driverWindow: 0 } };
+      acc.pushStatusCharacteristics();
+      const vent = acc.accessory.getServiceById('Switch', 'windowVentilation');
+      expect(vent.updateCharacteristic).toHaveBeenLastCalledWith(acc.Characteristic.On, true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('sends right away with commandDelaySeconds 0', async () => {
+    vi.useFakeTimers();
+    try {
+      const { acc, client } = makeAccessory({ commandDelaySeconds: 0 });
+      client.controlDoorWindows.mockResolvedValue({});
+      acc.requestSwitch('windowVentilation', true);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(client.controlDoorWindows).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('logs the delay in use at startup', () => {
+    const { log } = makeAccessory({ commandDelaySeconds: 3 });
+    expect(log.info).toHaveBeenCalledWith(expect.stringContaining('sent to the car 3 s after the last one'));
+  });
+});
